@@ -3,8 +3,6 @@ import torch
 import torch.nn as nn
 import math
 from sklearn.cluster import KMeans
-
-import torch
 from torch.distributions import Normal
 
 
