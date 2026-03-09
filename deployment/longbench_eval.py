@@ -300,8 +300,10 @@ def load_quantizers(model, quantizers, bits, include_sparse, sparsity_threshold,
 
 def reset_kv_cache(model):
     for layer in model.model.layers:
-        layer.self_attn.kcache.reset()
-        layer.self_attn.vcache.reset()
+        if layer.self_attn.kcache is not None:
+            layer.self_attn.kcache.reset()
+        if layer.self_attn.vcache is not None:
+            layer.self_attn.vcache.reset()
 
 
 # ── Inference ────────────────────────────────────────────────────────────────

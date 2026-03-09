@@ -1445,30 +1445,35 @@ class LlamaAttention(nn.Module):
 
         # arguments to initialize the KV cache are in the load_lookup_table functions
         # Use num_key_value_heads for KV cache sizing (supports GQA)
+        # Skip quantized cache allocation when running fp16 (bits=16)
         kv_hidden_size = self.num_key_value_heads * self.head_dim
-        self.kcache = QuantK(
-            bits=self.abits,
-            include_sparse=self.include_sparse,
-            hidden_size=kv_hidden_size,
-            num_heads=self.num_key_value_heads,
-            max_position_embeddings=maxseqlen,
-            rope_theta=self.rope_theta,
-            use_orig_sparse=self.use_orig_sparse,
-            first_few_fp16=self.first_few_fp16
-        )
-        self.vcache = QuantV(
-            bits=self.abits,
-            include_sparse=self.include_sparse,
-            hidden_size=kv_hidden_size,
-            num_heads=self.num_key_value_heads,
-            max_position_embeddings=maxseqlen,
-            first_few_fp16=self.first_few_fp16
-        )
+        if self.abits < 16:
+            self.kcache = QuantK(
+                bits=self.abits,
+                include_sparse=self.include_sparse,
+                hidden_size=kv_hidden_size,
+                num_heads=self.num_key_value_heads,
+                max_position_embeddings=maxseqlen,
+                rope_theta=self.rope_theta,
+                use_orig_sparse=self.use_orig_sparse,
+                first_few_fp16=self.first_few_fp16
+            )
+            self.vcache = QuantV(
+                bits=self.abits,
+                include_sparse=self.include_sparse,
+                hidden_size=kv_hidden_size,
+                num_heads=self.num_key_value_heads,
+                max_position_embeddings=maxseqlen,
+                first_few_fp16=self.first_few_fp16
+            )
 
-        # fp16 caches
-        if self.first_few_fp16 > 0:
-            self.kcache_fp16 = torch.zeros((1, self.num_key_value_heads, self.head_dim, self.first_few_fp16), dtype=torch.half).cuda()
-            self.vcache_fp16 = torch.zeros((1, self.num_key_value_heads, self.first_few_fp16, self.head_dim), dtype=torch.half).cuda()
+            # fp16 caches
+            if self.first_few_fp16 > 0:
+                self.kcache_fp16 = torch.zeros((1, self.num_key_value_heads, self.head_dim, self.first_few_fp16), dtype=torch.half).cuda()
+                self.vcache_fp16 = torch.zeros((1, self.num_key_value_heads, self.first_few_fp16, self.head_dim), dtype=torch.half).cuda()
+        else:
+            self.kcache = None
+            self.vcache = None
 
     def _init_rope(self):
         if self.config.rope_scaling is None and self.dynamicrope:
