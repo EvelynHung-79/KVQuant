@@ -1405,7 +1405,8 @@ class LlamaAttention(nn.Module):
         self.head_dim = self.hidden_size // self.num_heads
         self.num_key_value_heads = config.num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
-        assert (self.num_key_value_groups == 1) # kernels don't yet support GQA
+        # Note: custom quantized kernels (eager/flash) don't support GQA yet, but sdpa does
+        # assert (self.num_key_value_groups == 1)
         self.max_position_embeddings = config.max_position_embeddings
         self.rope_theta = config.rope_theta
         self.is_causal = True
@@ -1443,10 +1444,13 @@ class LlamaAttention(nn.Module):
         self.include_sparse = config.include_sparse
 
         # arguments to initialize the KV cache are in the load_lookup_table functions
+        # Use num_key_value_heads for KV cache sizing (supports GQA)
+        kv_hidden_size = self.num_key_value_heads * self.head_dim
         self.kcache = QuantK(
             bits=self.abits,
             include_sparse=self.include_sparse,
-            hidden_size=self.hidden_size,
+            hidden_size=kv_hidden_size,
+            num_heads=self.num_key_value_heads,
             max_position_embeddings=maxseqlen,
             rope_theta=self.rope_theta,
             use_orig_sparse=self.use_orig_sparse,
@@ -1455,15 +1459,16 @@ class LlamaAttention(nn.Module):
         self.vcache = QuantV(
             bits=self.abits,
             include_sparse=self.include_sparse,
-            hidden_size=self.hidden_size,
+            hidden_size=kv_hidden_size,
+            num_heads=self.num_key_value_heads,
             max_position_embeddings=maxseqlen,
             first_few_fp16=self.first_few_fp16
         )
 
         # fp16 caches
         if self.first_few_fp16 > 0:
-            self.kcache_fp16 = torch.zeros((1, self.num_heads, self.head_dim, self.first_few_fp16), dtype=torch.half).cuda()
-            self.vcache_fp16 = torch.zeros((1, self.num_heads, self.first_few_fp16, self.head_dim), dtype=torch.half).cuda()
+            self.kcache_fp16 = torch.zeros((1, self.num_key_value_heads, self.head_dim, self.first_few_fp16), dtype=torch.half).cuda()
+            self.vcache_fp16 = torch.zeros((1, self.num_key_value_heads, self.first_few_fp16, self.head_dim), dtype=torch.half).cuda()
 
     def _init_rope(self):
         if self.config.rope_scaling is None and self.dynamicrope:
@@ -2121,6 +2126,7 @@ class LlamaSdpaAttention(LlamaAttention):
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Cache] = None,
+        past_key_values_length_inp=None,
         output_attentions: bool = False,
         use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:

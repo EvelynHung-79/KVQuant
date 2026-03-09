@@ -1,22 +1,40 @@
 
 ## Step 0：建立環境
+
+```bash
+cd /root/KVQuant
 python3.11 -m venv venv
 source venv/bin/activate
 
-cd quant
+# 安裝基本套件
 pip install --upgrade pip
 pip install torch --index-url https://download.pytorch.org/whl/cu124
-pip install -e .
 pip install wheel datasets
-pip install flash-attn --no-build-isolation --no-cache-dir
+
+# 安裝 quant 套件
+cd quant
+pip install -e .
+cd ..
+
+# 安裝 deployment 用的 custom transformers（支援 KV cache 量化）
+pip install -e deployment/transformers/
+
+# 編譯 quant_cuda CUDA extension（deployment 推理用）
+cd deployment/kvquant
+python setup_cuda.py install
+cd ../..
+
+# NOTE: flash-attn 與 torch ABI 不相容，改用 sdpa，不需安裝 flash-attn
+```
 
  # Huggingface
  huggingface-cli login
  hf_MsunjexXeNDaolHSNtbppwsykJCmytScVcab
 
  # Copy Dataset
- scp -P 22956 -r -i ~/.ssh/id_ed25519_evelyn_r76134115 ./longbench_v1/ root@38.147.83.16:/root/LiveKVQuantP/data/
- scp -P 22029 -r -i ~/.ssh/id_ed25519_evelyn_r76134115 ./longbench_v1/musique.jsonl root@194.68.245.81:/root/LiveKVQuantP/data/longbench_v1/musique.jsonl
+ scp -P 40655 -r -i ~/.ssh/id_ed25519_evelyn_r76134115 ./longbench_v1/ root@38.147.83.26:/root/KVQuant/data/
+ scp -P 40655 -r -i ~/.ssh/id_ed25519_evelyn_r76134115 ./longbench_v1/musique.jsonl root@194.68.245.81:/root/KVQuant/data/longbench_v1/musique.jsonl
+ ssh root@38.147.83.26 -p 40655 -i ~/.ssh/id_ed25519
 
  # 拿掉 GitHub 最新 commit，但保留內容在 local
  git reset --soft HEAD~1
@@ -41,7 +59,7 @@ CUDA_VISIBLE_DEVICES=0 python run-fisher.py \
 ## Step 2：量化校準（產生 quantizers.pickle）
 cd ..
 cd quant
-CUDA_VISIBLE_DEVICES=0 python llama_simquant.py meta-llama/Llama-3.1-8B-Instruct \
+CUDA_VISIBLE_DEVICES=0 python llama_simquant.py meta-llama/Meta-Llama-3.1-8B-Instruct \
   --abits 4 \
   --nsamples 16 \
   --seqlen 2048 \
@@ -54,25 +72,19 @@ CUDA_VISIBLE_DEVICES=0 python llama_simquant.py meta-llama/Llama-3.1-8B-Instruct
   --quantizer-path quantizers.pickle
 
 ## Step 3：驗證（跑 Perplexity 確認量化正確）
-CUDA_VISIBLE_DEVICES=0 python llama_simquant.py meta-llama/Llama-3.1-8B-Instruct \
+CUDA_VISIBLE_DEVICES=0 python llama_simquant.py meta-llama/Meta-Llama-3.1-8B-Instruct \
   --abits 4 \
   --nuq \
   --include_sparse \
   --sparsity-threshold 0.99 \
   --first_few_fp16 5 \
-  --quantizer-path quantizers.pickle
+  --quantizer-path quantizers.pickle \
+  --seqlen 2048
+
+** 7.多是正常的
 
 ## Step 4：LongBench Evaluation
-
-# 把資料集放到 data 資料夾
-# 格式：每行一個 JSON，欄位有 input / context / answers / length
-# 資料夾路徑：KVQuant/data/longbench_v1/<task>.jsonl
-# 範例（從本機 scp 上傳）：
-scp -P 22956 -r -i ~/.ssh/id_ed25519_evelyn_r76134115 \
-  ./longbench_v1/ root@<server>:/root/KVQuant/data/
-
-cd ..
-cd deployment
+cd ../deployment
 
 # 確認 quantizers.pickle 在這個資料夾（從 quant/ 複製過來）
 cp ../quant/quantizers.pickle .

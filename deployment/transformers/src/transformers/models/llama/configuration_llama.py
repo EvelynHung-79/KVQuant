@@ -190,11 +190,14 @@ class LlamaConfig(PretrainedConfig):
         if self.rope_scaling is None:
             return
 
-        if not isinstance(self.rope_scaling, dict) or len(self.rope_scaling) != 2:
+        if not isinstance(self.rope_scaling, dict):
             raise ValueError(
-                "`rope_scaling` must be a dictionary with with two fields, `type` and `factor`, "
+                "`rope_scaling` must be a dictionary, "
                 f"got {self.rope_scaling}"
             )
+        # Normalize newer rope_scaling formats (e.g. Llama 3.1) to the old format
+        if "rope_type" in self.rope_scaling or len(self.rope_scaling) != 2:
+            self.rope_scaling = {"type": "linear", "factor": self.rope_scaling.get("factor", 1.0)}
         rope_scaling_type = self.rope_scaling.get("type", None)
         rope_scaling_factor = self.rope_scaling.get("factor", None)
         if rope_scaling_type is None or rope_scaling_type not in ["linear", "dynamic"]:

@@ -22,8 +22,12 @@ import pickle
 import re
 import string
 import time
+import warnings
 from collections import Counter
 from pathlib import Path
+
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
 
 import torch
 import numpy as np
@@ -274,7 +278,7 @@ def get_model(model_path, maxseqlen, bits, include_sparse, first_few_fp16):
     config.include_sparse = include_sparse
     model = AutoModelForCausalLM.from_pretrained(
         model_path, config=config, torch_dtype=torch.half,
-        use_flash_attention_2=True, device_map="cpu"
+        attn_implementation="sdpa", device_map="cpu"
     )
     return model
 
@@ -304,57 +308,46 @@ def reset_kv_cache(model):
 
 def run_inference(model, tokenizer, input_ids, output_len, chunk_size, DEV):
     """
-    Prefill in chunks, then decode token-by-token.
+    Prefill the full prompt, then decode token-by-token using HF DynamicCache.
     Returns (output_text, prefill_ms, decode_ms, peak_memory_mb).
     """
     input_ids = input_ids.to(DEV)
     prompt_len = input_ids.shape[1]
-    total_len = prompt_len + output_len
-    attention_mask = torch.ones((1, total_len), device=DEV)
+    attention_mask = torch.ones((1, prompt_len), device=DEV)
 
-    reset_kv_cache(model)
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats()
 
     # ── Prefill ──────────────────────────────────────────────────────────────
     t0 = time.time()
-    past_len = 0
     with torch.no_grad():
-        for start in range(0, prompt_len, chunk_size):
-            end = min(start + chunk_size, prompt_len)
-            chunk = input_ids[:, start:end]
-            model(
-                chunk,
-                past_key_values_length_inp=past_len,
-                attention_mask=attention_mask[:, : end].reshape(1, -1),
-            )
-            past_len = end
+        out = model(
+            input_ids,
+            attention_mask=attention_mask,
+            use_cache=True,
+        )
+    past_key_values = out.past_key_values
     torch.cuda.synchronize()
     prefill_ms = (time.time() - t0) * 1000
 
     # ── Decode ───────────────────────────────────────────────────────────────
-    generated = []
-    next_token = input_ids[:, -1:]  # last token of prompt as seed
-    # Re-run last prefill token to get next-token logits
-    with torch.no_grad():
-        out = model(
-            input_ids[:, -1:],
-            past_key_values_length_inp=prompt_len - 1,
-            attention_mask=attention_mask[:, :prompt_len].reshape(1, -1),
-        )
     next_token = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
-    generated.append(next_token.item())
+    generated = [next_token.item()]
 
     t1 = time.time()
     with torch.no_grad():
         for step in range(1, output_len):
             if next_token.item() == tokenizer.eos_token_id:
                 break
+            cur_len = prompt_len + step
+            attention_mask = torch.ones((1, cur_len), device=DEV)
             out = model(
                 next_token,
-                past_key_values_length_inp=prompt_len + step - 1,
-                attention_mask=attention_mask[:, : prompt_len + step].reshape(1, -1),
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                use_cache=True,
             )
+            past_key_values = out.past_key_values
             next_token = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
             generated.append(next_token.item())
     torch.cuda.synchronize()
@@ -476,6 +469,7 @@ def main():
     )
     model.eval()
     model.model.set_devices()
+    model.lm_head = model.lm_head.to(DEV)
 
     # ── Load quantizers ──────────────────────────────────────────────────────
     if args.bits != 16:
