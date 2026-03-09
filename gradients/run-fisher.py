@@ -37,11 +37,18 @@ def get_modules_kv(layer):
     return layer.self_attn.k_proj, layer.self_attn.v_proj
 
 
-def make_retain_grad_hook():
-    """Forward hook that retains the output gradient and saves the activation."""
-    def hook(module, inp, out):
-        out.retain_grad()
-        module.act = out
+def make_backward_hook(grads_dict, key):
+    """Backward hook that immediately squares, moves to CPU, and accumulates gradients.
+
+    Using a backward hook instead of retain_grad() avoids keeping all layers'
+    gradient tensors live on GPU simultaneously during the backward pass.
+    """
+    def hook(module, grad_input, grad_output):
+        grad_sq = (grad_output[0] ** 2).float().cpu()
+        if key not in grads_dict:
+            grads_dict[key] = grad_sq
+        else:
+            grads_dict[key] = torch.cat((grads_dict[key], grad_sq), dim=1)
     return hook
 
 
@@ -76,47 +83,36 @@ def train():
         config=config,
         cache_dir=training_args.cache_dir,
         trust_remote_code=True,
-    )
+        torch_dtype=torch.bfloat16,
+        low_cpu_mem_usage=True,
+    ).cuda()
 
     if config.vocab_size == 32001:
         model.resize_token_embeddings(32001)
-
-    model = model.bfloat16()
 
     if model_args.load:
         model.load_state_dict(torch.load(model_args.load), strict=False)
         model.eval()
 
+    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+
     _layers = model.model.layers
     grads = {}
 
-    # Register hooks once — they persist across all calibration samples
+    # Register backward hooks once — gradients are accumulated to CPU on the fly,
+    # so no large GPU tensors are retained between layers during the backward pass.
     handles = []
-    for layer in _layers:
+    for layer_idx, layer in enumerate(_layers):
         k_proj, v_proj = get_modules_kv(layer)
-        handles.append(k_proj.register_forward_hook(make_retain_grad_hook()))
-        handles.append(v_proj.register_forward_hook(make_retain_grad_hook()))
+        handles.append(k_proj.register_full_backward_hook(make_backward_hook(grads, f"k_proj{layer_idx}")))
+        handles.append(v_proj.register_full_backward_hook(make_backward_hook(grads, f"v_proj{layer_idx}")))
 
     for sample_idx, data in tqdm(enumerate(dataloader[:data_args.num_examples])):
         x = data[0].cuda()
         loss = model(input_ids=x, labels=x).loss
         loss.backward()
-
-        for layer_idx, layer in enumerate(_layers):
-            print(f"weight layer {layer_idx}")
-            k_proj, v_proj = get_modules_kv(layer)
-            kgrad = (k_proj.act.grad ** 2).float().cpu()
-            vgrad = (v_proj.act.grad ** 2).float().cpu()
-
-            if f"k_proj{layer_idx}" not in grads:
-                grads[f"k_proj{layer_idx}"] = kgrad
-            else:
-                grads[f"k_proj{layer_idx}"] = torch.cat((grads[f"k_proj{layer_idx}"], kgrad), dim=1)
-
-            if f"v_proj{layer_idx}" not in grads:
-                grads[f"v_proj{layer_idx}"] = vgrad
-            else:
-                grads[f"v_proj{layer_idx}"] = torch.cat((grads[f"v_proj{layer_idx}"], vgrad), dim=1)
+        model.zero_grad()
+        torch.cuda.empty_cache()
 
     for h in handles:
         h.remove()
