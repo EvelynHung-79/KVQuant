@@ -1,0 +1,147 @@
+{
+    "task": "narrativeqa",
+    "version": "v1",
+    "args": {
+        "input_mode": "longbench",
+        "model_id": "meta-llama/Meta-Llama-3.1-8B-Instruct",
+        "bench_version": "v1",
+        "task_type": "narrativeqa",
+        "num_samples": -1,
+        "output_len": 64,
+        "chunk_size": 512,
+        "n_warmup": 2,
+        "bits": 4,
+        "ema_alpha": 0.2,
+        "clip_factor_n": 4.0,
+        "outlier_ratio": 0.01,
+        "effective_output_len": 128
+    },
+    "avg_score": 0.2924479553556177,
+    "avg_end_to_end_latency_ms": 14156.303508188576,
+    "avg_prefill_latency_ms": 13497.385219223797,
+    "avg_decode_latency_ms": 658.9182889647782,
+    "max_peak_memory_mb": 28629.52685546875,
+    "details": [
+        {
+            "index": 0,
+            "score": 0.42857142857142855,
+            "metric": "F1",
+            "output": "He is living with the Mulvilles at Wimbledon.",
+            "ground_truth": "He is a guest in the home of the Mulvilles.",
+            "peak_memory_mb": 21776.87109375,
+            "end_to_end_latency_ms": 13657.896012067795,
+            "prefill_latency_ms": 12869.421068578959,
+            "decode_latency_ms": 788.4749434888363
+        },
+        {
+            "index": 1,
+            "score": 0.09523809523809525,
+            "metric": "F1",
+            "output": "She feels gratitude and has her heart entirely engrossed by one object.",
+            "ground_truth": "Because she is in unrequited love with someone else",
+            "peak_memory_mb": 21791.5888671875,
+            "end_to_end_latency_ms": 13590.749498456717,
+            "prefill_latency_ms": 12637.87117600441,
+            "decode_latency_ms": 952.8783224523067
+        },
+        {
+            "index": 2,
+            "score": 0.2,
+            "metric": "F1",
+            "output": "On Atlas' mountain within a cavern by a secret fountain.",
+            "ground_truth": "The Atlas Mountains",
+            "peak_memory_mb": 21613.15185546875,
+            "end_to_end_latency_ms": 2743.762645870447,
+            "prefill_latency_ms": 2177.4265617132187,
+            "decode_latency_ms": 566.3360841572285
+        },
+        {
+            "index": 3,
+            "score": 0.33333333333333326,
+            "metric": "F1",
+            "output": "To persuade Socrates to escape from prison.",
+            "ground_truth": "To smuggle Socrates out of prison and into a life of exile.",
+            "peak_memory_mb": 17303.6337890625,
+            "end_to_end_latency_ms": 2910.080499947071,
+            "prefill_latency_ms": 2476.349927484989,
+            "decode_latency_ms": 433.7305724620819
+        },
+        {
+            "index": 4,
+            "score": 0.0,
+            "metric": "F1",
+            "output": "He wanted to fulfill his oath to make the red cock crow on Drachenhausen.",
+            "ground_truth": "Otto was so young.",
+            "peak_memory_mb": 22892.08544921875,
+            "end_to_end_latency_ms": 16982.08923265338,
+            "prefill_latency_ms": 15800.92254653573,
+            "decode_latency_ms": 1181.166686117649
+        },
+        {
+            "index": 5,
+            "score": 0.6666666666666666,
+            "metric": "F1",
+            "output": "At least six hours.",
+            "ground_truth": "Six hours.",
+            "peak_memory_mb": 22689.15234375,
+            "end_to_end_latency_ms": 4337.654806673527,
+            "prefill_latency_ms": 4062.5998713076115,
+            "decode_latency_ms": 275.0549353659153
+        },
+        {
+            "index": 6,
+            "score": 0.5714285714285715,
+            "metric": "F1",
+            "output": "With Lisa, Plog's wife.",
+            "ground_truth": "Lisa, the blacksmith's wife.",
+            "peak_memory_mb": 21745.05859375,
+            "end_to_end_latency_ms": 12745.371755212545,
+            "prefill_latency_ms": 12189.293459057808,
+            "decode_latency_ms": 556.0782961547375
+        },
+        {
+            "index": 7,
+            "score": 0.8,
+            "metric": "F1",
+            "output": "Janosz Poha.",
+            "ground_truth": "Dr. Janosz Poha",
+            "peak_memory_mb": 24855.439453125,
+            "end_to_end_latency_ms": 23468.037892132998,
+            "prefill_latency_ms": 22874.673504382372,
+            "decode_latency_ms": 593.3643877506256
+        },
+        {
+            "index": 8,
+            "score": 0.5,
+            "metric": "F1",
+            "output": "American.",
+            "ground_truth": "She is an American.",
+            "peak_memory_mb": 24632.68505859375,
+            "end_to_end_latency_ms": 12701.568119227886,
+            "prefill_latency_ms": 12477.46168449521,
+            "decode_latency_ms": 224.10643473267555
+        },
+        {
+            "index": 9,
+            "score": 0.6666666666666666,
+            "metric": "F1",
+            "output": "The lying scribe.",
+            "ground_truth": "The scribe.",
+            "peak_memory_mb": 21609.4423828125,
+            "end_to_end_latency_ms": 2442.2643668949604,
+            "prefill_latency_ms": 2186.6936199367046,
+            "decode_latency_ms": 255.57074695825577
+        },
+        {
+            "index": 10,
+            "score": 0.375,
+            "metric": "F1",
+            "output": "His knowledge of the First World War and its tactics.",
+            "ground_truth": "Because he fought in the first world war.",
+            "peak_memory_mb": 22779.916015625,
+            "end_to_end_latency_ms": 16033.316437155008,
+            "prefill_latency_ms": 15245.686624199152,
+            "decode_latency_ms": 787.6298129558563
+        }
+    ]
+}

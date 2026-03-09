@@ -1,0 +1,9 @@
+accelerate
+sentencepiece
+tokenizers>=0.12.1
+torch
+transformers==4.57.3
+huggingface_hub==0.36.0
+datasets
+scikit-learn
+matplotlib

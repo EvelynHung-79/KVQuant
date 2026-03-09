@@ -38,7 +38,7 @@ def get_model(model, seqlen, maxseqlen):
         config.rope_scaling = {"type": "linear", "factor": scaling_factor}
 
     from transformers import AutoModelForCausalLM
-    model = AutoModelForCausalLM.from_pretrained(model, config=config, trust_remote_code=True, use_flash_attention_2=True, torch_dtype=torch.half)
+    model = AutoModelForCausalLM.from_pretrained(model, config=config, trust_remote_code=True, attn_implementation="flash_attention_2", dtype=torch.half)
 
     model.seqlen = seqlen  #TODO
     if config.vocab_size == 32001:
@@ -65,7 +65,7 @@ def llama_eval(model, testenc, dev):
     inps = torch.zeros(
         (nsamples, model.seqlen, model.config.hidden_size), dtype=dtype, device=dev
     )
-    cache = {'i': 0, 'attention_mask': None}
+    cache = {'i': 0, 'attention_mask': None, 'position_ids': None, 'position_embeddings': None}
 
     class Catcher(nn.Module):
         def __init__(self, module):
@@ -74,9 +74,9 @@ def llama_eval(model, testenc, dev):
         def forward(self, inp, **kwargs):
             inps[cache['i']] = inp
             cache['i'] += 1
-            cache['attention_mask'] = kwargs['attention_mask']
-            if 'position_ids' in kwargs:
-                cache['position_ids'] = kwargs['position_ids']
+            cache['attention_mask'] = kwargs.get('attention_mask', None)
+            cache['position_ids'] = kwargs.get('position_ids', None)
+            cache['position_embeddings'] = kwargs.get('position_embeddings', None)
             raise ValueError
 
     layers[0] = Catcher(layers[0])
@@ -96,6 +96,7 @@ def llama_eval(model, testenc, dev):
     outs = torch.zeros_like(inps)
     attention_mask = cache['attention_mask']
     position_ids = cache['position_ids']
+    position_embeddings = cache['position_embeddings']
 
     for i in range(len(layers)):
         print("Layer", i)
@@ -109,11 +110,12 @@ def llama_eval(model, testenc, dev):
                 )[0]
             else:
                 assert model_type == 'llama'
-                outs[j] = layer(
-                    inps[j].unsqueeze(0),
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                )[0]
+                layer_kwargs = {'attention_mask': attention_mask}
+                if position_embeddings is not None:
+                    layer_kwargs['position_embeddings'] = position_embeddings
+                else:
+                    layer_kwargs['position_ids'] = position_ids
+                outs[j] = layer(inps[j].unsqueeze(0), **layer_kwargs)[0]
 
         layers[i] = layer.cpu()
         del layer
@@ -161,7 +163,7 @@ def llama_calibration(model, dataloader, dev, perchannel_match, pertensor_match,
     inps = torch.zeros(
         (args.nsamples, model.seqlen, model.config.hidden_size), dtype=dtype, device=dev
     )
-    cache = {'i': 0, 'attention_mask': None}
+    cache = {'i': 0, 'attention_mask': None, 'position_ids': None, 'position_embeddings': None}
 
     class Catcher(nn.Module):
         def __init__(self, module):
@@ -170,8 +172,9 @@ def llama_calibration(model, dataloader, dev, perchannel_match, pertensor_match,
         def forward(self, inp, **kwargs):
             inps[cache['i']] = inp
             cache['i'] += 1
-            cache['attention_mask'] = kwargs['attention_mask']
-            cache['position_ids'] = kwargs['position_ids']
+            cache['attention_mask'] = kwargs.get('attention_mask', None)
+            cache['position_ids'] = kwargs.get('position_ids', None)
+            cache['position_embeddings'] = kwargs.get('position_embeddings', None)
             raise ValueError
     layers[0] = Catcher(layers[0])
     for batch in dataloader:
@@ -189,6 +192,7 @@ def llama_calibration(model, dataloader, dev, perchannel_match, pertensor_match,
     outs = torch.zeros_like(inps)
     attention_mask = cache['attention_mask']
     position_ids = cache['position_ids']
+    position_embeddings = cache['position_embeddings']
 
     print('Quantizing ...')
 
@@ -245,11 +249,12 @@ def llama_calibration(model, dataloader, dev, perchannel_match, pertensor_match,
             handles.append(subset[name].register_forward_hook(add_batch(name)))
 
         for j in range(args.nsamples):
-            outs[j] = layer(
-                inps[j].unsqueeze(0),
-                attention_mask=attention_mask,
-                position_ids=position_ids
-            )[0]
+            layer_kwargs = {'attention_mask': attention_mask}
+            if position_embeddings is not None:
+                layer_kwargs['position_embeddings'] = position_embeddings
+            else:
+                layer_kwargs['position_ids'] = position_ids
+            outs[j] = layer(inps[j].unsqueeze(0), **layer_kwargs)[0]
 
         for h in handles:
             h.remove()

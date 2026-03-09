@@ -1,18 +1,37 @@
 
 ## Step 0：建立環境
-python3.10 -m venv venv
+python3.11 -m venv venv
 source venv/bin/activate
 
 cd quant
 pip install --upgrade pip
 pip install torch --index-url https://download.pytorch.org/whl/cu124
 pip install -e .
-pip install flash-attn --no-build-isolation
-pip install datasets
+pip install wheel datasets
+pip install flash-attn --no-build-isolation --no-cache-dir
+
+ # Huggingface
+ huggingface-cli login
+ hf_MsunjexXeNDaolHSNtbppwsykJCmytScVcab
+
+ # Copy Dataset
+ scp -P 22956 -r -i ~/.ssh/id_ed25519_evelyn_r76134115 ./longbench_v1/ root@38.147.83.16:/root/LiveKVQuantP/data/
+ scp -P 22029 -r -i ~/.ssh/id_ed25519_evelyn_r76134115 ./longbench_v1/musique.jsonl root@194.68.245.81:/root/LiveKVQuantP/data/longbench_v1/musique.jsonl
+
+ # 拿掉 GitHub 最新 commit，但保留內容在 local
+ git reset --soft HEAD~1
+ git push --force-with-lease
+
+ # Setup name and gmail
+ git config user.name Evelyn
+ git config user.email chia20010709@gmail.com
+
+ # Download Claude Code Extension
 
 ## Step 1：計算 Fisher Information（可選，但效果更好）
+cd ..
 cd gradients
-python run-fisher.py \
+CUDA_VISIBLE_DEVICES=0 python run-fisher.py \
   --model_name_or_path meta-llama/Llama-3.1-8B-Instruct \
   --dataset c4 \
   --num_examples 16 \
@@ -20,6 +39,7 @@ python run-fisher.py \
   --output_dir /tmp/fisher_output
 
 ## Step 2：量化校準（產生 quantizers.pickle）
+cd ..
 cd quant
 CUDA_VISIBLE_DEVICES=0 python llama_simquant.py meta-llama/Llama-3.1-8B-Instruct \
   --abits 4 \
@@ -42,8 +62,49 @@ CUDA_VISIBLE_DEVICES=0 python llama_simquant.py meta-llama/Llama-3.1-8B-Instruct
   --first_few_fp16 5 \
   --quantizer-path quantizers.pickle
 
-## Step 4：LongBench Evaluation（需要新增）
-# 安裝 LongBench
-pip install rouge_score jieba fuzz
+## Step 4：LongBench Evaluation
 
+# 把資料集放到 data 資料夾
+# 格式：每行一個 JSON，欄位有 input / context / answers / length
+# 資料夾路徑：KVQuant/data/longbench_v1/<task>.jsonl
+# 範例（從本機 scp 上傳）：
+scp -P 22956 -r -i ~/.ssh/id_ed25519_evelyn_r76134115 \
+  ./longbench_v1/ root@<server>:/root/KVQuant/data/
+
+cd ..
+cd deployment
+
+# 確認 quantizers.pickle 在這個資料夾（從 quant/ 複製過來）
+cp ../quant/quantizers.pickle .
+
+# 跑單一 task（4-bit 量化）
+CUDA_VISIBLE_DEVICES=0 python longbench_eval.py \
+  meta-llama/Meta-Llama-3.1-8B-Instruct \
+  --task narrativeqa \
+  --bits 4 \
+  --quantizer-path quantizers.pickle \
+  --include_sparse \
+  --sparsity-threshold 0.99 \
+  --first_few_fp16 5 \
+  --output-len 64 \
+  --chunk-size 512 \
+  --n-warmup 2 \
+  --output-path results/narrativeqa_4bit.json
+
+# 跑 baseline（fp16，不量化）
+CUDA_VISIBLE_DEVICES=0 python longbench_eval.py \
+  meta-llama/Meta-Llama-3.1-8B-Instruct \
+  --task narrativeqa \
+  --bits 16 \
+  --output-len 64 \
+  --chunk-size 512 \
+  --n-warmup 2 \
+  --output-path results/narrativeqa_fp16.json
+
+# 支援的 task：
+# narrativeqa, qasper, multifieldqa_en, hotpotqa, 2wikimqa, musique,
+# gov_report, qmsum, multi_news, trec, triviaqa, samsum,
+# passage_count, passage_retrieval_en, lcc, repobench-p
+
+# 結果存在 deployment/results/<task>.json（格式同 longbench_sample_output.json）
 
