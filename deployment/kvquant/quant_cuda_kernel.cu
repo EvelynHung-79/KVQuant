@@ -70,7 +70,8 @@ __global__ void SPMV_ATOMIC_ROPE_BALANCED(
     int headdim,
     int num_outliers,
     float rope_theta,
-    int pos_offset
+    int pos_offset,
+    int num_groups
 );
 
 template <typename scalar_t>
@@ -118,7 +119,8 @@ __global__ void SPMV_ATOMIC_BALANCED(
     int fullwidth,
     int numheads,
     int headdim,
-    int num_outliers
+    int num_outliers,
+    int num_groups
 );
 
 __global__ void VecQuant4MatMulKernelNUQPerChannelTransposedMHABatchedFusedOpt(
@@ -131,7 +133,8 @@ __global__ void VecQuant4MatMulKernelNUQPerChannelTransposedMHABatchedFusedOpt(
     int fullwidth,
     int headdim,
     int numheads,
-    int batch_size
+    int batch_size,
+    int num_groups
 );
 
 __global__ void VecQuant4MatMulKernelNUQPerChannelTransposedRopeMHABatchedFusedOpt(
@@ -146,7 +149,8 @@ __global__ void VecQuant4MatMulKernelNUQPerChannelTransposedRopeMHABatchedFusedO
     int numheads,
     int batch_size,
     float rope_theta,
-    int pos_offset
+    int pos_offset,
+    int num_groups
 );
 
 __global__ void VecQuant3MatMulKernelNUQPerChannelTransposedMHABatchedFusedOpt(
@@ -443,7 +447,8 @@ __global__ void SPMV_ATOMIC_BALANCED(
     int fullwidth,
     int numheads,
     int headdim,
-    int num_outliers
+    int num_outliers,
+    int num_groups
 ) {
 
     int threadid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -458,13 +463,18 @@ __global__ void SPMV_ATOMIC_BALANCED(
 
         for (int i = start; i < end; i++) {
 
-            int row = outlier_indices[i];
-            int headid = row / headdim;
-            float vval = vec[headid * seqlen + col];
+            int kv_row = outlier_indices[i];       // index in KV-head dimension space
+            int kv_headid = kv_row / headdim;      // which KV head
+            int channel = kv_row % headdim;        // which channel within the head
 
-            dot = outliers[i] * vval;
-
-            atomicAdd(&mul[row], dot);
+            // For each Q head that maps to this KV head
+            for (int g = 0; g < num_groups; g++) {
+                int q_headid = kv_headid * num_groups + g;
+                float vval = vec[q_headid * seqlen + col];
+                dot = outliers[i] * vval;
+                int q_row = q_headid * headdim + channel;
+                atomicAdd(&mul[q_row], dot);
+            }
         }
     }
 }
@@ -481,7 +491,8 @@ __global__ void SPMV_ATOMIC_ROPE_BALANCED(
     int headdim,
     int num_outliers,
     float rope_theta,
-    int pos_offset
+    int pos_offset,
+    int num_groups
 ) {
 
     int threadid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -491,31 +502,32 @@ __global__ void SPMV_ATOMIC_ROPE_BALANCED(
         float sign;
         float c, s;
 
-        float dot = 0;
-
         int start = threadid * num_outliers;
         int end = (threadid+1) * num_outliers;
         int row = threadid;
 
         for (int i = start; i < end; i++) {
-            int col = outlier_indices[i];
+            int kv_col = outlier_indices[i];          // index in KV-head dimension space
             float mat_tmp = outliers[i];
 
-            int headid = col / headdim;
-            int channel_head_off = col % headdim; // needed for RoPE pos
+            int kv_headid = kv_col / headdim;
+            int channel_head_off = kv_col % headdim;  // position within head (for RoPE)
 
-            // RoPE embeddings
-            theta = powf ( rope_theta , (-2 * __int2float_rd(channel_head_off % (headdim/2)) / headdim) );
+            // RoPE embeddings (same for all Q heads sharing this KV head)
+            theta = powf(rope_theta, (-2 * __int2float_rd(channel_head_off % (headdim/2)) / headdim));
             sign = (channel_head_off < (headdim/2)) ? 1 : -1;
             c = cosf(theta * (row + pos_offset));
             s = sinf(theta * (row + pos_offset));
 
-            // compute dot products
-            int col2 = ((channel_head_off + (headdim/2)) % headdim ) + headid * headdim;
-            dot = mat_tmp * c * vec[col];
-            dot += sign * mat_tmp * s * vec[col2];
-
-            atomicAdd(&mul[headid * kcachelen + row], dot);
+            // For each Q head that maps to this KV head
+            for (int g = 0; g < num_groups; g++) {
+                int q_headid = kv_headid * num_groups + g;
+                int q_col  = q_headid * headdim + channel_head_off;
+                int q_col2 = q_headid * headdim + ((channel_head_off + headdim/2) % headdim);
+                float dot = mat_tmp * c * vec[q_col];
+                dot += sign * mat_tmp * s * vec[q_col2];
+                atomicAdd(&mul[q_headid * kcachelen + row], dot);
+            }
         }
     }
 }
@@ -3049,13 +3061,19 @@ __global__ void VecQuant4MatMulKernelNUQPerChannelTransposedRopeMHABatchedFusedO
     int numheads,
     int batch_size,
     float rope_theta,
-    int pos_offset
+    int pos_offset,
+    int num_groups   // num_q_heads / num_kv_heads; 1 for MHA
 ) {
 
-  int headid = blockIdx.z;
-  int headoffset = headdim * headid; // in terms of number of logical rows
+  // GQA: blockIdx.z indexes Q heads (0..num_q_heads-1)
+  int q_headid  = blockIdx.z;
+  int kv_headid = blockIdx.z / num_groups;
+  int num_q_heads = numheads * num_groups;  // numheads == num_kv_heads
 
-  int packedheadoffset = (headoffset * BLOCKHEIGHT4) / BLOCKWIDTH; // in terms of packed words
+  int kv_headoffset = headdim * kv_headid; // used for K cache LUT and mat
+  int q_headoffset  = headdim * q_headid;  // used for Q vec and output
+
+  int packedheadoffset = (kv_headoffset * BLOCKHEIGHT4) / BLOCKWIDTH; // packed K mat row offset
 
   int row = packedheadoffset + BLOCKHEIGHT4 * blockIdx.x;
   int col = BLOCKWIDTH * blockIdx.y + threadIdx.x;
@@ -3067,7 +3085,8 @@ __global__ void VecQuant4MatMulKernelNUQPerChannelTransposedRopeMHABatchedFusedO
   __shared__ float deq2[17][BLOCKWIDTH];
   int off = threadIdx.x;
 
-  int lut_row = headoffset + BLOCKWIDTH * blockIdx.x + threadIdx.x;
+  // LUT is (num_kv_heads, headdim, 16) -> indexed by kv_headid
+  int lut_row = kv_headoffset + BLOCKWIDTH * blockIdx.x + threadIdx.x;
   int row_offset = lut_row * 16;
 
   float tmp5 = 0;
@@ -3102,10 +3121,11 @@ __global__ void VecQuant4MatMulKernelNUQPerChannelTransposedRopeMHABatchedFusedO
     __syncthreads();
     i = fullwidth * row + col;
 
-    int vec_batch_offset = b * headdim * numheads;
+    // Q vec is (batch, num_q_heads, headdim) -> index by q_headid
+    int vec_batch_offset = b * headdim * num_q_heads;
     int headdim2 = headdim/2;
-    blockvec[threadIdx.x] = vec[vec_batch_offset + (row / BLOCKHEIGHT4) * BLOCKWIDTH + threadIdx.x];
-    blockvec2[threadIdx.x] = vec[vec_batch_offset + (row / BLOCKHEIGHT4) * BLOCKWIDTH + (threadIdx.x+headdim2)%headdim];
+    blockvec[threadIdx.x] = vec[vec_batch_offset + q_headoffset + blockIdx.x * BLOCKWIDTH + threadIdx.x];
+    blockvec2[threadIdx.x] = vec[vec_batch_offset + q_headoffset + blockIdx.x * BLOCKWIDTH + (threadIdx.x+headdim2)%headdim];
 
     __syncthreads();
 
@@ -3202,8 +3222,9 @@ __global__ void VecQuant4MatMulKernelNUQPerChannelTransposedRopeMHABatchedFusedO
         i += fullwidth;
       }
 
-      int mul_batch_offset = b * width * numheads;
-      atomicAdd(&mul[mul_batch_offset + headid * width + col], res);
+      // Output: (batch, num_q_heads, kseqlen) -> index by q_headid
+      int mul_batch_offset = b * width * num_q_heads;
+      atomicAdd(&mul[mul_batch_offset + q_headid * width + col], res);
     }
   }
 }
@@ -3218,13 +3239,19 @@ __global__ void VecQuant4MatMulKernelNUQPerChannelTransposedMHABatchedFusedOpt(
     int fullwidth,
     int headdim,
     int numheads,
-    int batch_size
+    int batch_size,
+    int num_groups   // num_q_heads / num_kv_heads; 1 for MHA
 ) {
 
-  int headid = blockIdx.z;
-  int headoffset = headdim * headid; // in terms of number of logical rows
+  // GQA: blockIdx.z indexes Q heads (0..num_q_heads-1)
+  int q_headid  = blockIdx.z;
+  int kv_headid = blockIdx.z / num_groups;
+  int num_q_heads = numheads * num_groups;  // numheads == num_kv_heads
 
-  int packedheadoffset = (headoffset * BLOCKHEIGHT4) / BLOCKWIDTH; // in terms of packed words
+  int kv_headoffset = headdim * kv_headid; // used for V cache mat
+  int q_headoffset  = headdim * q_headid;  // used for score vec and output
+
+  int packedheadoffset = (kv_headoffset * BLOCKHEIGHT4) / BLOCKWIDTH; // packed V mat row offset
 
   int row = packedheadoffset + BLOCKHEIGHT4 * blockIdx.x;
   int col = BLOCKWIDTH * blockIdx.y + threadIdx.x;
@@ -3273,16 +3300,18 @@ __global__ void VecQuant4MatMulKernelNUQPerChannelTransposedMHABatchedFusedOpt(
     // instead of * width, but we already multiplied row by headdim instead of width
     i = fullwidth * row + col;
     k = 0;
-    int vec_batch_offset = b * width * numheads;
+    // Score vec is (batch, num_q_heads, vseqlen) -> index by q_headid
+    int vec_batch_offset = b * width * num_q_heads;
 
     // CHECK 2 for sequence length
     if (col < width) {
-      blockvec[threadIdx.x] = vec[vec_batch_offset + width * headid + col];
+      blockvec[threadIdx.x] = vec[vec_batch_offset + width * q_headid + col];
     }
     __syncthreads();
 
-    int mul_batch_offset = b * headdim * numheads;
-    int mul_head_offset = (row / BLOCKHEIGHT4) * BLOCKWIDTH;
+    // Output is (batch, num_q_heads, headdim) -> index by q_headid
+    int mul_batch_offset = b * headdim * num_q_heads;
+    int mul_head_offset = q_headoffset + blockIdx.x * BLOCKWIDTH;
 
     // CHECK 3 for sequence length
     float blockvec_offset = blockvec[off];
@@ -3445,35 +3474,37 @@ void vecquant4matmul_nuq_perchannel_transposed_rope_mha_batched_fused_opt_cuda(
   // torch::Tensor value
 ) {
 
-  // mul - out - (num_heads, qseqlen, kseqlen)
+  // mul - out - (batch, num_q_heads, kseqlen)
   int batch_size = mul.size(0);
-  int mul_num_heads = mul.size(1);
+  int mul_num_heads = mul.size(1);  // num_q_heads
   int mul_height = mul.size(2);
 
-  // vec - in - (num_heads, qseqlen, head_dim)
+  // vec - in - (batch, num_q_heads, head_dim)
   int vbatch_size = vec.size(0);
-  int num_vec_heads = vec.size(1);
+  int num_q_heads = vec.size(1);
   int vec_height = vec.size(2);
   assert (vbatch_size == batch_size);
 
-  // mat - kvcache - (num_heads, head_dim, kseqlen)
-  int numheads = mat.size(0);
-  int height = mat.size(1); // headdim
-  int width = kcachelen; // sequence length
-  int fullwidth = mat.size(2); // max sequence length
+  // mat - K cache - (num_kv_heads, packed_headdim, max_kseqlen)
+  int num_kv_heads = mat.size(0);
+  int height = mat.size(1);
+  int width = kcachelen;
+  int fullwidth = mat.size(2);
   assert(width == mul_height);
 
-  // lookup table - (num_heads, head_dim, 16)
+  // lookup table - (num_kv_heads, head_dim, 16)
   int numheads2 = lookup_table.size(0);
   int headdim = lookup_table.size(1);
   int lutlen = lookup_table.size(2);
   assert (headdim == vec_height);
-  assert (numheads == numheads2);
+  assert (num_kv_heads == numheads2);
+
+  int num_groups = num_q_heads / num_kv_heads;
 
   dim3 blocks(
     (height + BLOCKHEIGHT4 - 1) / BLOCKHEIGHT4,
     (width + BLOCKWIDTH - 1) / BLOCKWIDTH,
-    (numheads)
+    num_q_heads   // one block-z per Q head
   );
   dim3 threads(BLOCKWIDTH);
 
@@ -3482,7 +3513,8 @@ void vecquant4matmul_nuq_perchannel_transposed_rope_mha_batched_fused_opt_cuda(
     mat.data_ptr<int>(),
     mul.data_ptr<float>(),
     lookup_table.data_ptr<float>(),
-    height, width, fullwidth, headdim, numheads, batch_size, rope_theta, pos_offset
+    height, width, fullwidth, headdim, num_kv_heads, batch_size, rope_theta, pos_offset,
+    num_groups
   );
 
 }
@@ -3508,8 +3540,8 @@ void vecquant4matmul_nuq_perchannel_transposed_mha_batched_fused_opt_cuda(
   int vec_height = vec.size(2); // v seqlen
   assert (vbatch_size == batch_size);
 
-  // mat - kvcache - (num_heads, packed_head_dim, vseqlen)
-  int numheads = mat.size(0);
+  // mat - kvcache - (num_kv_heads, packed_head_dim, vseqlen)
+  int num_kv_heads = mat.size(0);
   int height = mat.size(1); // headdim (packed)
   int width = vcachelen; // v sequence length
   int fullwidth = mat.size(2); // v sequence length (full max seqlen)
@@ -3520,10 +3552,13 @@ void vecquant4matmul_nuq_perchannel_transposed_mha_batched_fused_opt_cuda(
   int lutlen = lookup_table.size(1);
   assert (lutseqlen == fullwidth);
 
+  int num_q_heads = mul_num_heads;  // mul: (batch, num_q_heads, headdim)
+  int num_groups  = num_q_heads / num_kv_heads;
+
   dim3 blocks(
     (height + BLOCKHEIGHT4 - 1) / BLOCKHEIGHT4,
     (width + BLOCKWIDTH - 1) / BLOCKWIDTH,
-    (numheads)
+    num_q_heads
   );
   dim3 threads(BLOCKWIDTH);
 
@@ -3532,7 +3567,8 @@ void vecquant4matmul_nuq_perchannel_transposed_mha_batched_fused_opt_cuda(
     mat.data_ptr<int>(),
     mul.data_ptr<float>(),
     lookup_table.data_ptr<float>(),
-    height, width, fullwidth, headdim, numheads, batch_size
+    height, width, fullwidth, headdim, num_kv_heads, batch_size,
+    num_groups
   );
 
 }
@@ -3562,24 +3598,27 @@ void vecquant4matmul_nuq_perchannel_transposed_rope_mha_batched_fused_opt2_cuda(
   int vec_height = vec.size(2);
   assert (vbatch_size == batch_size);
 
-  // mat - kvcache - (num_heads, head_dim, kseqlen)
-  int numheads = mat.size(0);
-  int height = mat.size(1); // headdim
+  // mat - K cache - (num_kv_heads, packed_headdim, max_kseqlen)
+  int num_kv_heads = mat.size(0);
+  int height = mat.size(1); // headdim (packed)
   int width = kcachelen; // sequence length
   int fullwidth = mat.size(2); // max sequence length
   assert(width == mul_height);
 
-  // lookup table - (num_heads, head_dim, 16)
+  // lookup table - (num_kv_heads, head_dim, 16)
   int numheads2 = lookup_table.size(0);
   int headdim = lookup_table.size(1);
   int lutlen = lookup_table.size(2);
   assert (headdim == vec_height);
-  assert (numheads == numheads2);
+  assert (num_kv_heads == numheads2);
+
+  int num_q_heads = num_vec_heads;
+  int num_groups  = num_q_heads / num_kv_heads;
 
   dim3 blocks(
     (height + BLOCKHEIGHT4 - 1) / BLOCKHEIGHT4,
     (width + BLOCKWIDTH - 1) / BLOCKWIDTH,
-    (numheads)
+    num_q_heads
   );
   dim3 threads(BLOCKWIDTH);
 
@@ -3592,10 +3631,11 @@ void vecquant4matmul_nuq_perchannel_transposed_rope_mha_batched_fused_opt2_cuda(
     width,
     fullwidth,
     headdim,
-    numheads,
+    num_kv_heads,
     batch_size,
     rope_theta,
-    pos_offset
+    pos_offset,
+    num_groups
   );
 
   int seqlen = outliers.size(0); //full sequence length
@@ -3613,11 +3653,12 @@ void vecquant4matmul_nuq_perchannel_transposed_rope_mha_batched_fused_opt2_cuda(
     mul.data<float>(),
     kcachelen,
     fullwidth,
-    numheads,
+    num_kv_heads,
     headdim,
     num_outliers,
     rope_theta,
-    pos_offset
+    pos_offset,
+    num_groups
   );
 }
 
@@ -3643,8 +3684,8 @@ void vecquant4matmul_nuq_perchannel_transposed_mha_batched_fused_opt2_cuda(
   int num_vec_heads = vec.size(1);
   int vec_height = vec.size(2); // v seqlen
 
-  // mat - kvcache - (num_heads, packed_head_dim, vseqlen)
-  int numheads = mat.size(0);
+  // mat - V cache - (num_kv_heads, packed_head_dim, vseqlen)
+  int num_kv_heads = mat.size(0);
   int height = mat.size(1); // headdim (packed)
   int width = vcachelen; // v sequence length
   int fullwidth = mat.size(2); // v sequence length (full max seqlen)
@@ -3653,10 +3694,13 @@ void vecquant4matmul_nuq_perchannel_transposed_mha_batched_fused_opt2_cuda(
   int lutseqlen = lookup_table.size(0);
   int lutlen = lookup_table.size(1);
 
+  int num_q_heads = mul_num_heads;  // mul: (batch, num_q_heads, headdim)
+  int num_groups  = num_q_heads / num_kv_heads;
+
   dim3 blocks(
     (height + BLOCKHEIGHT4 - 1) / BLOCKHEIGHT4,
     (width + BLOCKWIDTH - 1) / BLOCKWIDTH,
-    (numheads)
+    num_q_heads
   );
   dim3 threads(BLOCKWIDTH);
 
@@ -3665,7 +3709,8 @@ void vecquant4matmul_nuq_perchannel_transposed_mha_batched_fused_opt2_cuda(
     mat.data_ptr<int>(),
     mul.data_ptr<float>(),
     lookup_table.data_ptr<float>(),
-    height, width, fullwidth, headdim, numheads, batch_size
+    height, width, fullwidth, headdim, num_kv_heads, batch_size,
+    num_groups
   );
 
   int seqlen = outliers.size(0); //full sequence length
@@ -3683,9 +3728,10 @@ void vecquant4matmul_nuq_perchannel_transposed_mha_batched_fused_opt2_cuda(
     mul.data<float>(),
     vcachelen,
     fullwidth,
-    numheads,
+    num_kv_heads,
     headdim,
-    num_outliers
+    num_outliers,
+    num_groups
   );
 }
 
@@ -4672,7 +4718,8 @@ void vecquant3matmul_nuq_perchannel_transposed_rope_mha_batched_fused_opt2_cuda(
     headdim,
     num_outliers,
     rope_theta,
-    pos_offset
+    pos_offset,
+    1  // num_groups=1 for 3-bit (MHA only)
   );
 }
 
@@ -4740,7 +4787,8 @@ void vecquant3matmul_nuq_perchannel_transposed_mha_batched_fused_opt2_cuda(
     fullwidth,
     numheads,
     headdim,
-    num_outliers
+    num_outliers,
+    1  // num_groups=1 for 3-bit (MHA only)
   );
 }
 
@@ -5430,7 +5478,8 @@ void vecquant2matmul_nuq_perchannel_transposed_rope_mha_batched_fused_opt2_cuda(
     headdim,
     num_outliers,
     rope_theta,
-    pos_offset
+    pos_offset,
+    1  // num_groups=1 for 2-bit (MHA only)
   );
 }
 
@@ -5498,7 +5547,8 @@ void vecquant2matmul_nuq_perchannel_transposed_mha_batched_fused_opt2_cuda(
     fullwidth,
     numheads,
     headdim,
-    num_outliers
+    num_outliers,
+    1  // num_groups=1 for 2-bit (MHA only)
   );
 }
 
@@ -5545,10 +5595,13 @@ void vecquant4matmul_nuq_perchannel_transposed_rope_mha_batched_fused_opt2_orig_
   assert (headdim == vec_height);
   assert (numheads == numheads2);
 
+  int num_q_heads_orig_k = vec.size(1);
+  int num_groups_orig_k  = num_q_heads_orig_k / numheads;
+
   dim3 blocks(
     (height + BLOCKHEIGHT4 - 1) / BLOCKHEIGHT4,
     (width + BLOCKWIDTH - 1) / BLOCKWIDTH,
-    (numheads)
+    num_q_heads_orig_k
   );
   dim3 threads(BLOCKWIDTH);
 
@@ -5565,7 +5618,8 @@ void vecquant4matmul_nuq_perchannel_transposed_rope_mha_batched_fused_opt2_orig_
     numheads,
     batch_size,
     rope_theta,
-    pos_offset
+    pos_offset,
+    num_groups_orig_k
   );
 
   // check if no nonzeros yet
@@ -5632,10 +5686,13 @@ void vecquant4matmul_nuq_perchannel_transposed_mha_batched_fused_opt2_orig_cuda(
   int lutseqlen = lookup_table.size(0);
   int lutlen = lookup_table.size(1);
 
+  int num_q_heads_orig_v = vec.size(1);
+  int num_groups_orig_v  = num_q_heads_orig_v / numheads;
+
   dim3 blocks(
     (height + BLOCKHEIGHT4 - 1) / BLOCKHEIGHT4,
     (width + BLOCKWIDTH - 1) / BLOCKWIDTH,
-    (numheads)
+    num_q_heads_orig_v
   );
   dim3 threads(BLOCKWIDTH);
 
@@ -5644,7 +5701,7 @@ void vecquant4matmul_nuq_perchannel_transposed_mha_batched_fused_opt2_orig_cuda(
     mat.data_ptr<int>(),
     mul.data_ptr<float>(),
     lookup_table.data_ptr<float>(),
-    height, width, fullwidth, headdim, numheads, batch_size
+    height, width, fullwidth, headdim, numheads, batch_size, num_groups_orig_v
   );
 
   // balanced

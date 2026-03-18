@@ -5,13 +5,12 @@ Data folder: ../data/longbench_v1/<task>.jsonl
 
 Usage:
     CUDA_VISIBLE_DEVICES=0 python longbench_eval.py \
-        meta-llama/Meta-Llama-3.1-8B-Instruct \
+        --model meta-llama/Meta-Llama-3.1-8B-Instruct \
         --task narrativeqa \
         --bits 4 \
         --quantizer-path quantizers.pickle \
         --include_sparse \
-        --sparsity-threshold 0.99 \
-        --first_few_fp16 5 \
+        --first_few_fp16 1 \
         --output-path results/narrativeqa.json
 """
 
@@ -19,403 +18,51 @@ import argparse
 import json
 import os
 import pickle
-import re
-import string
-import time
+import sys
 import warnings
-from collections import Counter
-from pathlib import Path
+from datetime import datetime
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
 
-import torch
+# Load custom KVQuant transformers and quant_cuda before any `from transformers` import
+_here = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(_here, "transformers", "src"))
+
+# quant_cuda: add build directory to sys.path so `import quant_cuda` works
+import glob as _glob
+_cuda_builds = _glob.glob(os.path.join(_here, "kvquant", "build", "lib.*", "quant_cuda*.so"))
+if _cuda_builds:
+    sys.path.insert(0, os.path.dirname(_cuda_builds[0]))
+
 import numpy as np
+import torch
 
+from kvquant_model import get_model, load_quantizers, run_inference
+from longbench_scoring import score_sample
 
-# ── Prompt templates (LongBench v1) ─────────────────────────────────────────
+import importlib.util as _ilu
 
-TASK_PROMPTS = {
-    "narrativeqa": (
-        "You are given a story, which can be quite long, and a question. "
-        "Answer the question as concisely as you can, using a single phrase if possible. "
-        "Do not provide any explanation.\n\n"
-        "Story: {context}\n\n"
-        "Now, answer the question based on the story as concisely as you can, "
-        "using a single phrase if possible. Do not provide any explanation.\n\n"
-        "Question: {input}\n\nAnswer:"
-    ),
-    "qasper": (
-        "You are given a scientific article and a question. "
-        "Answer the question as concisely as you can, using a single phrase or sentence if possible. "
-        "If the question cannot be answered based on the information in the article, write \"unanswerable\". "
-        "If the question is a yes/no question, answer \"yes\", \"no\", or \"unanswerable\". "
-        "Do not provide any explanation.\n\n"
-        "Article: {context}\n\n"
-        "Answer the question based on the above article as concisely as you can, "
-        "using a single phrase or sentence if possible. "
-        "If the question cannot be answered based on the information in the article, write \"unanswerable\". "
-        "If the question is a yes/no question, answer \"yes\", \"no\", or \"unanswerable\". "
-        "Do not provide any explanation.\n\n"
-        "Question: {input}\n\nAnswer:"
-    ),
-    "multifieldqa_en": (
-        "Read the following text and answer briefly.\n\n"
-        "{context}\n\n"
-        "Now, answer the following question based on the above text, "
-        "only give me the answer and do not output any other words.\n\n"
-        "Question: {input}\nAnswer:"
-    ),
-    "hotpotqa": (
-        "Answer the question based on the given passages. "
-        "Only give me the answer and do not output any other words.\n\n"
-        "The following are given passages.\n{context}\n\n"
-        "Answer the question based on the given passages. "
-        "Only give me the answer and do not output any other words.\n\n"
-        "Question: {input}\nAnswer:"
-    ),
-    "2wikimqa": (
-        "Answer the question based on the given passages. "
-        "Only give me the answer and do not output any other words.\n\n"
-        "The following are given passages.\n{context}\n\n"
-        "Answer the question based on the given passages. "
-        "Only give me the answer and do not output any other words.\n\n"
-        "Question: {input}\nAnswer:"
-    ),
-    "musique": (
-        "Answer the question based on the given passages. "
-        "Only give me the answer and do not output any other words.\n\n"
-        "The following are given passages.\n{context}\n\n"
-        "Answer the question based on the given passages. "
-        "Only give me the answer and do not output any other words.\n\n"
-        "Question: {input}\nAnswer:"
-    ),
-    "gov_report": (
-        "You are given a report by a government agency. "
-        "Write a one-page summary of the report.\n\n"
-        "Report:\n{context}\n\n"
-        "Now, write a one-page summary of the report.\n\nSummary:"
-    ),
-    "qmsum": (
-        "You are given a meeting transcript and a query containing a question or instruction. "
-        "Answer the query in one or more sentences.\n\n"
-        "Transcript:\n{context}\n\n"
-        "Now, answer the query based on the above meeting transcript in one or more sentences.\n\n"
-        "Query: {input}\nAnswer:"
-    ),
-    "multi_news": (
-        "You are given several news passages. Write a one-page summary of all news passages.\n\n"
-        "News:\n{context}\n\n"
-        "Now, write a one-page summary of all the news passages.\n\nSummary:"
-    ),
-    "trec": (
-        "Please determine the type of the question below. Here are some examples of questions.\n\n"
-        "{context}\n{input}"
-    ),
-    "triviaqa": (
-        "Answer the question based on the given passage. "
-        "Only give me the answer and do not output any other words. "
-        "The following are some examples.\n\n"
-        "{context}\n\n{input}"
-    ),
-    "samsum": (
-        "Summarize the dialogue into a few short sentences. The following are some examples.\n\n"
-        "{context}\n\n{input}"
-    ),
-    "passage_count": (
-        "There are some paragraphs below sourced from Wikipedia. "
-        "Some of them may be duplicates. "
-        "Please carefully read these paragraphs and determine how many unique paragraphs there are after "
-        "removing duplicates. In other words, how many non-repeating paragraphs are there in total?\n\n"
-        "{context}\n\n"
-        "Please enter the final count of unique paragraphs after removing duplicates. "
-        "The output format should only contain the final count, e.g., 1, 2, 3, ...\n\nThe number of unique paragraphs:"
-    ),
-    "passage_retrieval_en": (
-        "Here are 30 paragraphs from Wikipedia, along with an abstract. "
-        "Please determine which paragraph the abstract is from.\n\n"
-        "{context}\n\n"
-        "The following is an abstract.\n\n{input}\n\n"
-        "Please enter the number of the paragraph that the abstract is from. "
-        "The answer format must be like \"Paragraph 3\", \"Paragraph 1\", etc.\n\nThe answer is:"
-    ),
-    "lcc": (
-        "Please complete the code given below.\n{context}Next line of code:\n"
-    ),
-    "repobench-p": (
-        "Please complete the code given below.\n{context}{input}Next line of code:\n"
-    ),
-}
+def _load_data_module(name):
+    path = os.path.join(_here, "..", "data", f"{name}.py")
+    spec = _ilu.spec_from_file_location(name, path)
+    mod = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
-TASK_METRICS = {
-    "narrativeqa": "F1",
-    "qasper": "F1",
-    "multifieldqa_en": "F1",
-    "hotpotqa": "F1",
-    "2wikimqa": "F1",
-    "musique": "F1",
-    "gov_report": "rouge-l",
-    "qmsum": "rouge-l",
-    "multi_news": "rouge-l",
-    "trec": "accuracy",
-    "triviaqa": "F1",
-    "samsum": "rouge-l",
-    "passage_count": "accuracy",
-    "passage_retrieval_en": "accuracy",
-    "lcc": "edit_sim",
-    "repobench-p": "edit_sim",
-}
+_lb_data = _load_data_module("longbench_data")
+build_prompt = _lb_data.build_prompt
+load_dataset = _lb_data.load_dataset
+COMPLETION_TASKS = _lb_data.COMPLETION_TASKS
 
+_lb_const = _load_data_module("longbench_constants")
+TASK_METRICS = _lb_const.TASK_METRICS
+TASK_OUTPUT_LEN = _lb_const.TASK_OUTPUT_LEN
 
-# ── Scoring functions ────────────────────────────────────────────────────────
-
-def normalize_answer(s):
-    def remove_articles(text):
-        return re.sub(r"\b(a|an|the)\b", " ", text)
-    def white_space_fix(text):
-        return " ".join(text.split())
-    def remove_punc(text):
-        exclude = set(string.punctuation)
-        return "".join(ch for ch in text if ch not in exclude)
-    def lower(text):
-        return text.lower()
-    return white_space_fix(remove_articles(remove_punc(lower(s))))
-
-
-def f1_score(prediction, ground_truth):
-    pred_tokens = normalize_answer(prediction).split()
-    gt_tokens = normalize_answer(ground_truth).split()
-    common = Counter(pred_tokens) & Counter(gt_tokens)
-    num_same = sum(common.values())
-    if num_same == 0:
-        return 0.0
-    precision = num_same / len(pred_tokens)
-    recall = num_same / len(gt_tokens)
-    return (2 * precision * recall) / (precision + recall)
-
-
-def rouge_l_score(prediction, ground_truth):
-    """Sentence-level ROUGE-L (F1)."""
-    def lcs_length(x, y):
-        m, n = len(x), len(y)
-        dp = [[0] * (n + 1) for _ in range(m + 1)]
-        for i in range(1, m + 1):
-            for j in range(1, n + 1):
-                if x[i - 1] == y[j - 1]:
-                    dp[i][j] = dp[i - 1][j - 1] + 1
-                else:
-                    dp[i][j] = max(dp[i - 1][j], dp[i][j - 1])
-        return dp[m][n]
-
-    pred_tokens = normalize_answer(prediction).split()
-    gt_tokens = normalize_answer(ground_truth).split()
-    if not pred_tokens or not gt_tokens:
-        return 0.0
-    lcs = lcs_length(pred_tokens, gt_tokens)
-    precision = lcs / len(pred_tokens)
-    recall = lcs / len(gt_tokens)
-    if precision + recall == 0:
-        return 0.0
-    return (2 * precision * recall) / (precision + recall)
-
-
-def edit_sim_score(prediction, ground_truth):
-    """Normalized edit similarity (1 - edit_distance / max_len)."""
-    def edit_distance(s1, s2):
-        m, n = len(s1), len(s2)
-        dp = list(range(n + 1))
-        for i in range(1, m + 1):
-            prev = dp[0]
-            dp[0] = i
-            for j in range(1, n + 1):
-                temp = dp[j]
-                if s1[i - 1] == s2[j - 1]:
-                    dp[j] = prev
-                else:
-                    dp[j] = 1 + min(prev, dp[j], dp[j - 1])
-                prev = temp
-        return dp[n]
-
-    if not prediction and not ground_truth:
-        return 1.0
-    max_len = max(len(prediction), len(ground_truth))
-    if max_len == 0:
-        return 1.0
-    return 1.0 - edit_distance(prediction, ground_truth) / max_len
-
-
-def accuracy_score(prediction, ground_truth):
-    return float(normalize_answer(prediction) == normalize_answer(ground_truth))
-
-
-def score_sample(prediction, answers, metric):
-    """Score one prediction against a list of ground truth answers."""
-    if metric == "F1":
-        return max(f1_score(prediction, ans) for ans in answers)
-    elif metric == "rouge-l":
-        return max(rouge_l_score(prediction, ans) for ans in answers)
-    elif metric == "edit_sim":
-        return max(edit_sim_score(prediction, ans) for ans in answers)
-    elif metric == "accuracy":
-        return max(accuracy_score(prediction, ans) for ans in answers)
-    else:
-        raise ValueError(f"Unknown metric: {metric}")
-
-
-# ── Model loading ────────────────────────────────────────────────────────────
-
-def get_model(model_path, maxseqlen, bits, include_sparse, first_few_fp16):
-    def skip(*args, **kwargs):
-        pass
-    torch.nn.init.kaiming_uniform_ = skip
-    torch.nn.init.uniform_ = skip
-    torch.nn.init.normal_ = skip
-    from transformers import AutoConfig, AutoModelForCausalLM
-    config = AutoConfig.from_pretrained(model_path)
-    config.first_few_fp16 = first_few_fp16
-    config.maxseqlen = maxseqlen
-    config.abits = bits
-    config.include_sparse = include_sparse
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path, config=config, torch_dtype=torch.half,
-        attn_implementation="sdpa", device_map="cpu"
-    )
-    return model
-
-
-def load_quantizers(model, quantizers, bits, include_sparse, sparsity_threshold, norm):
-    layers = model.model.layers
-    for k in quantizers.keys():
-        if '.lut' in k:
-            continue
-        ln = int(k.split('.')[-3])
-        q = quantizers[k]
-        if "k_proj" in k:
-            layers[ln].self_attn.kcache.reset()
-            layers[ln].self_attn.kcache.load_lookup_table(q, include_sparse, sparsity_threshold, norm)
-        elif "v_proj" in k:
-            layers[ln].self_attn.vcache.reset()
-            layers[ln].self_attn.vcache.load_lookup_table(q, include_sparse, sparsity_threshold, norm)
-
-
-def reset_kv_cache(model):
-    for layer in model.model.layers:
-        layer.self_attn.kcache.reset()
-        layer.self_attn.vcache.reset()
-
-
-# ── Inference ────────────────────────────────────────────────────────────────
-
-def run_inference(model, tokenizer, input_ids, output_len, chunk_size, DEV):
-    """
-    Prefill the full prompt, then decode token-by-token using HF DynamicCache.
-    Returns (output_text, prefill_ms, decode_ms, peak_memory_mb).
-    """
-    input_ids = input_ids.to(DEV)
-    prompt_len = input_ids.shape[1]
-    attention_mask = torch.ones((1, prompt_len), device=DEV)
-
-    torch.cuda.synchronize()
-    torch.cuda.reset_peak_memory_stats()
-
-    # ── Prefill ──────────────────────────────────────────────────────────────
-    t0 = time.time()
-    with torch.no_grad():
-        out = model(
-            input_ids,
-            attention_mask=attention_mask,
-            use_cache=True,
-        )
-    past_key_values = out.past_key_values
-    torch.cuda.synchronize()
-    prefill_ms = (time.time() - t0) * 1000
-
-    # ── Decode ───────────────────────────────────────────────────────────────
-    next_token = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
-    generated = [next_token.item()]
-
-    t1 = time.time()
-    with torch.no_grad():
-        for step in range(1, output_len):
-            if next_token.item() == tokenizer.eos_token_id:
-                break
-            cur_len = prompt_len + step
-            attention_mask = torch.ones((1, cur_len), device=DEV)
-            out = model(
-                next_token,
-                attention_mask=attention_mask,
-                past_key_values=past_key_values,
-                use_cache=True,
-            )
-            past_key_values = out.past_key_values
-            next_token = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
-            generated.append(next_token.item())
-    torch.cuda.synchronize()
-    decode_ms = (time.time() - t1) * 1000
-
-    peak_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
-    output_text = tokenizer.decode(generated, skip_special_tokens=True)
-    return output_text, prefill_ms, decode_ms, peak_mb
-
-
-# ── Dataset loading ──────────────────────────────────────────────────────────
-
-def load_dataset(data_dir, task):
-    path = os.path.join(data_dir, f"{task}.jsonl")
-    if not os.path.exists(path):
-        raise FileNotFoundError(
-            f"Dataset not found: {path}\n"
-            f"Please put {task}.jsonl in {data_dir}"
-        )
-    samples = []
-    with open(path) as f:
-        for line in f:
-            samples.append(json.loads(line.strip()))
-    return samples
-
-
-def build_prompt(sample, task, tokenizer, max_input_tokens):
-    """Build a chat-formatted prompt and truncate context if needed."""
-    template = TASK_PROMPTS.get(task)
-    if template is None:
-        raise ValueError(f"Unsupported task: {task}. Supported: {list(TASK_PROMPTS)}")
-
-    context = sample.get("context", "")
-    inp = sample.get("input", "")
-
-    # Truncate context to fit within max_input_tokens
-    ctx_tokens = tokenizer.encode(context, add_special_tokens=False)
-    inp_tokens = tokenizer.encode(inp, add_special_tokens=False)
-    # Leave room for template overhead (~200 tokens) and input
-    max_ctx = max_input_tokens - len(inp_tokens) - 300
-    if max_ctx < 0:
-        max_ctx = 0
-    if len(ctx_tokens) > max_ctx:
-        ctx_tokens = ctx_tokens[:max_ctx]
-        context = tokenizer.decode(ctx_tokens, skip_special_tokens=True)
-
-    user_content = template.format(context=context, input=inp)
-
-    # LLaMA-3 chat format
-    messages = [
-        {"role": "system", "content": "You are a helpful assistant."},
-        {"role": "user", "content": user_content},
-    ]
-    if hasattr(tokenizer, "apply_chat_template"):
-        prompt = tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
-    else:
-        prompt = f"[INST] {user_content} [/INST]"
-
-    return prompt
-
-
-# ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("model", type=str, help="Model path or HuggingFace ID")
+    parser.add_argument("--model", type=str, default="meta-llama/Meta-Llama-3.1-8B-Instruct", help="Model path or HuggingFace ID")
     parser.add_argument("--task", type=str, required=True,
                         help="LongBench task name (e.g. narrativeqa)")
     parser.add_argument("--data-dir", type=str,
@@ -425,26 +72,22 @@ def main():
                         help="Path to save JSON result (default: results/<task>.json)")
     parser.add_argument("--bits", type=int, default=4, choices=[2, 3, 4, 16],
                         help="KV cache quantization bits (16 = no quantization)")
-    parser.add_argument("--quantizer-path", type=str, default=None,
+    parser.add_argument("--quantizer-path", type=str, default="quant/quantizers.pickle",
                         help="Path to quantizers.pickle")
-    parser.add_argument("--include_sparse", action="store_true",
+    parser.add_argument("--include_sparse", action="store_true", default=True,
                         help="Use dense-and-sparse quantization")
     parser.add_argument("--sparsity-threshold", type=float, default=0.99,
                         help="Outlier percentile threshold")
-    parser.add_argument("--first_few_fp16", type=int, default=0,
+    parser.add_argument("--first_few_fp16", type=int, default=1,
                         help="Keep first N tokens in fp16")
     parser.add_argument("--norm", action="store_true",
                         help="Use q-norm")
     parser.add_argument("--num-samples", type=int, default=-1,
                         help="Number of samples to evaluate (-1 = all)")
-    parser.add_argument("--output-len", type=int, default=64,
-                        help="Max new tokens to generate")
     parser.add_argument("--chunk-size", type=int, default=512,
                         help="Prefill chunk size in tokens")
     parser.add_argument("--maxseqlen", type=int, default=32768,
                         help="Max sequence length (KV cache size)")
-    parser.add_argument("--n-warmup", type=int, default=2,
-                        help="Number of warmup samples before timing")
     args = parser.parse_args()
 
     DEV = torch.device("cuda:0")
@@ -452,7 +95,8 @@ def main():
     # ── Output path ──────────────────────────────────────────────────────────
     if args.output_path is None:
         os.makedirs("results", exist_ok=True)
-        args.output_path = f"results/{args.task}.json"
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        args.output_path = f"results/{timestamp}_{args.task}.json"
 
     # ── Load tokenizer ───────────────────────────────────────────────────────
     from transformers import AutoTokenizer
@@ -491,8 +135,11 @@ def main():
         samples = samples[: args.num_samples]
     print(f"  {len(samples)} samples")
 
+    output_len = TASK_OUTPUT_LEN.get(args.task, 64)
+    print(f"  output_len: {output_len} tokens")
+
     metric_name = TASK_METRICS.get(args.task, "F1")
-    max_input_tokens = args.maxseqlen - args.output_len - 10
+    max_input_tokens = args.maxseqlen - output_len - 10
 
     # ── Evaluate ─────────────────────────────────────────────────────────────
     details = []
@@ -506,25 +153,26 @@ def main():
         if isinstance(answers, str):
             answers = [answers]
 
-        is_warmup = idx < args.n_warmup
-
         output_text, prefill_ms, decode_ms, peak_mb = run_inference(
-            model, tokenizer, input_ids, args.output_len, args.chunk_size, DEV
+            model, tokenizer, input_ids, output_len, args.chunk_size, DEV,
+            stop_on_newline=(args.task in COMPLETION_TASKS)
         )
+
+        if args.task in {"trec", "triviaqa", "samsum"}:
+            output_text = output_text.lstrip('\n').split('\n')[0]
 
         score = score_sample(output_text, answers, metric_name)
 
         print(
-            f"[{'WARMUP ' if is_warmup else ''}{idx}] "
+            f"[{idx}] "
             f"score={score:.4f}  prefill={prefill_ms:.0f}ms  "
             f"decode={decode_ms:.0f}ms  peak={peak_mb:.1f}MB"
         )
         print(f"  output   : {output_text[:120]}")
         print(f"  expected : {answers[0][:120]}")
 
-        if not is_warmup:
-            scores.append(score)
-            details.append({
+        scores.append(score)
+        details.append({
                 "index": idx,
                 "score": score,
                 "metric": metric_name,
@@ -551,21 +199,22 @@ def main():
             "bench_version": "v1",
             "task_type": args.task,
             "num_samples": args.num_samples,
-            "output_len": args.output_len,
+            "output_len": output_len,
             "chunk_size": args.chunk_size,
-            "n_warmup": args.n_warmup,
             "bits": args.bits,
             "include_sparse": args.include_sparse,
             "sparsity_threshold": args.sparsity_threshold,
             "first_few_fp16": args.first_few_fp16,
             "maxseqlen": args.maxseqlen,
         },
-        "avg_score": avg_score,
-        "avg_end_to_end_latency_ms": avg_e2e,
-        "avg_prefill_latency_ms": avg_prefill,
-        "avg_decode_latency_ms": avg_decode,
-        "max_peak_memory_mb": max_peak,
-        "details": details,
+        "results": {
+            "avg_score": avg_score,
+            "avg_end_to_end_latency_ms": avg_e2e,
+            "avg_prefill_latency_ms": avg_prefill,
+            "avg_decode_latency_ms": avg_decode,
+            "max_peak_memory_mb": max_peak,
+        },
+        "details": details
     }
 
     os.makedirs(os.path.dirname(os.path.abspath(args.output_path)), exist_ok=True)

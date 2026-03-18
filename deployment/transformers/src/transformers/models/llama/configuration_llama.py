@@ -186,6 +186,7 @@ class LlamaConfig(PretrainedConfig):
     def _rope_scaling_validation(self):
         """
         Validate the `rope_scaling` configuration.
+        Supports old format {"type": ..., "factor": ...} and new HF format {"rope_type": "llama3", ...}.
         """
         if self.rope_scaling is None:
             return
@@ -195,14 +196,17 @@ class LlamaConfig(PretrainedConfig):
                 "`rope_scaling` must be a dictionary, "
                 f"got {self.rope_scaling}"
             )
-        # Normalize newer rope_scaling formats (e.g. Llama 3.1) to the old format
-        if "rope_type" in self.rope_scaling or len(self.rope_scaling) != 2:
-            self.rope_scaling = {"type": "linear", "factor": self.rope_scaling.get("factor", 1.0)}
+
+        # Normalize: prefer "rope_type" (new format) over "type" (old format)
+        if "rope_type" in self.rope_scaling and "type" not in self.rope_scaling:
+            self.rope_scaling["type"] = self.rope_scaling["rope_type"]
+
         rope_scaling_type = self.rope_scaling.get("type", None)
         rope_scaling_factor = self.rope_scaling.get("factor", None)
-        if rope_scaling_type is None or rope_scaling_type not in ["linear", "dynamic"]:
+        supported_types = ["linear", "dynamic", "llama3"]
+        if rope_scaling_type is None or rope_scaling_type not in supported_types:
             raise ValueError(
-                f"`rope_scaling`'s type field must be one of ['linear', 'dynamic'], got {rope_scaling_type}"
+                f"`rope_scaling`'s type field must be one of {supported_types}, got {rope_scaling_type}"
             )
         if rope_scaling_factor is None or not isinstance(rope_scaling_factor, float) or rope_scaling_factor <= 1.0:
             raise ValueError(f"`rope_scaling`'s factor field must be a float > 1, got {rope_scaling_factor}")

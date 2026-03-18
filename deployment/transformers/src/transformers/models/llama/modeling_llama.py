@@ -222,6 +222,56 @@ class LlamaDynamicNTKScalingRotaryEmbedding(LlamaRotaryEmbedding):
         self.register_buffer("sin_cached", emb.sin().to(dtype), persistent=False)
 
 
+class LlamaLlama3ScalingRotaryEmbedding(LlamaRotaryEmbedding):
+    """LlamaRotaryEmbedding with Llama 3.1 RoPE scaling.
+
+    Uses per-frequency interpolation with smooth blending between high-freq and low-freq bands,
+    as described in the Llama 3.1 paper. Replaces the incorrect 'linear' scaling previously used.
+    """
+
+    def __init__(self, dim, max_position_embeddings=131072, base=500000.0, device=None,
+                 scaling_factor=8.0, low_freq_factor=1.0, high_freq_factor=4.0,
+                 original_max_position_embeddings=8192):
+        self.scaling_factor = scaling_factor
+        self.low_freq_factor = low_freq_factor
+        self.high_freq_factor = high_freq_factor
+        self.original_max_position_embeddings = original_max_position_embeddings
+        # Compute Llama3-specific inv_freq before calling super().__init__,
+        # which will call _set_cos_sin_cache using self.inv_freq.
+        # We temporarily set self.dim and self.base so _compute_inv_freq can use them.
+        self.dim = dim
+        self.base = base
+        inv_freq = self._compute_llama3_inv_freq(device)
+        # Register inv_freq before super().__init__ calls _set_cos_sin_cache
+        # We call nn.Module.__init__ directly to avoid re-computing inv_freq in super()
+        nn.Module.__init__(self)
+        self.dim = dim
+        self.base = base
+        self.max_position_embeddings = max_position_embeddings
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self._set_cos_sin_cache(
+            seq_len=max_position_embeddings, device=self.inv_freq.device, dtype=torch.get_default_dtype()
+        )
+
+    def _compute_llama3_inv_freq(self, device=None):
+        inv_freq = 1.0 / (
+            self.base ** (torch.arange(0, self.dim, 2, dtype=torch.int64).float().to(device) / self.dim)
+        )
+        low_freq_wavelen  = self.original_max_position_embeddings / self.low_freq_factor
+        high_freq_wavelen = self.original_max_position_embeddings / self.high_freq_factor
+        wavelen = 2 * math.pi / inv_freq
+        # High-freq: keep as-is; low-freq: divide by scale factor; medium: smooth blend
+        inv_freq_llama = torch.where(wavelen > low_freq_wavelen, inv_freq / self.scaling_factor, inv_freq)
+        smooth_factor = (
+            (self.original_max_position_embeddings / wavelen - self.low_freq_factor)
+            / (self.high_freq_factor - self.low_freq_factor)
+        )
+        smoothed = (1 - smooth_factor) * inv_freq_llama / self.scaling_factor + smooth_factor * inv_freq_llama
+        is_medium = ~(wavelen < high_freq_wavelen) & ~(wavelen > low_freq_wavelen)
+        inv_freq_llama = torch.where(is_medium, smoothed, inv_freq_llama)
+        return inv_freq_llama
+
+
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""
     x1 = x[..., : x.shape[-1] // 2]
@@ -393,8 +443,10 @@ class QuantK(nn.Module):
 
         # outlier params
         if self.include_sparse:
-            self.outliers = torch.zeros((self.max_len,42), dtype=torch.float).cuda()
-            self.outlier_indices = torch.zeros((self.max_len,42), dtype=torch.int).cuda()
+            # Compute buffer size from sparsity threshold and hidden_size (supports GQA kv_hidden_size)
+            num_outliers_per_token = 2 * (int(((1 - sparsity_threshold) / 2) * hidden_size) + 1)
+            self.outliers = torch.zeros((self.max_len, num_outliers_per_token), dtype=torch.float).cuda()
+            self.outlier_indices = torch.zeros((self.max_len, num_outliers_per_token), dtype=torch.int).cuda()
 
         # For LWM - rope theta
         self.rope_theta = rope_theta
@@ -1405,8 +1457,7 @@ class LlamaAttention(nn.Module):
         self.head_dim = self.hidden_size // self.num_heads
         self.num_key_value_heads = config.num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
-        # Note: custom quantized kernels (eager/flash) don't support GQA yet, but sdpa does
-        # assert (self.num_key_value_groups == 1)
+        # GQA is fully supported by the 4-bit quantized kernels (num_groups = num_q_heads / num_kv_heads)
         self.max_position_embeddings = config.max_position_embeddings
         self.rope_theta = config.rope_theta
         self.is_causal = True
@@ -1445,30 +1496,35 @@ class LlamaAttention(nn.Module):
 
         # arguments to initialize the KV cache are in the load_lookup_table functions
         # Use num_key_value_heads for KV cache sizing (supports GQA)
+        # Skip quantized cache allocation when running fp16 (bits=16)
         kv_hidden_size = self.num_key_value_heads * self.head_dim
-        self.kcache = QuantK(
-            bits=self.abits,
-            include_sparse=self.include_sparse,
-            hidden_size=kv_hidden_size,
-            num_heads=self.num_key_value_heads,
-            max_position_embeddings=maxseqlen,
-            rope_theta=self.rope_theta,
-            use_orig_sparse=self.use_orig_sparse,
-            first_few_fp16=self.first_few_fp16
-        )
-        self.vcache = QuantV(
-            bits=self.abits,
-            include_sparse=self.include_sparse,
-            hidden_size=kv_hidden_size,
-            num_heads=self.num_key_value_heads,
-            max_position_embeddings=maxseqlen,
-            first_few_fp16=self.first_few_fp16
-        )
+        if self.abits < 16:
+            self.kcache = QuantK(
+                bits=self.abits,
+                include_sparse=self.include_sparse,
+                hidden_size=kv_hidden_size,
+                num_heads=self.num_key_value_heads,
+                max_position_embeddings=maxseqlen,
+                rope_theta=self.rope_theta,
+                use_orig_sparse=self.use_orig_sparse,
+                first_few_fp16=self.first_few_fp16
+            )
+            self.vcache = QuantV(
+                bits=self.abits,
+                include_sparse=self.include_sparse,
+                hidden_size=kv_hidden_size,
+                num_heads=self.num_key_value_heads,
+                max_position_embeddings=maxseqlen,
+                first_few_fp16=self.first_few_fp16
+            )
 
-        # fp16 caches
-        if self.first_few_fp16 > 0:
-            self.kcache_fp16 = torch.zeros((1, self.num_key_value_heads, self.head_dim, self.first_few_fp16), dtype=torch.half).cuda()
-            self.vcache_fp16 = torch.zeros((1, self.num_key_value_heads, self.first_few_fp16, self.head_dim), dtype=torch.half).cuda()
+            # fp16 caches
+            if self.first_few_fp16 > 0:
+                self.kcache_fp16 = torch.zeros((1, self.num_key_value_heads, self.head_dim, self.first_few_fp16), dtype=torch.half).cuda()
+                self.vcache_fp16 = torch.zeros((1, self.num_key_value_heads, self.first_few_fp16, self.head_dim), dtype=torch.half).cuda()
+        else:
+            self.kcache = None
+            self.vcache = None
 
     def _init_rope(self):
         if self.config.rope_scaling is None and self.dynamicrope:
@@ -1485,14 +1541,30 @@ class LlamaAttention(nn.Module):
                 device="cpu"
             )
         else:
-            scaling_type = self.config.rope_scaling["type"]
-            scaling_factor = self.config.rope_scaling["factor"]
-            if scaling_type == "linear":
+            # Support both old-format {"type": ...} and new HF format {"rope_type": ...}
+            scaling_type = self.config.rope_scaling.get("rope_type") or self.config.rope_scaling.get("type", "linear")
+            scaling_factor = self.config.rope_scaling.get("factor", 1.0)
+            # rope_theta may live inside rope_scaling (new HF config format) or as a top-level attribute
+            rope_base = self.config.rope_scaling.get("rope_theta", self.rope_theta)
+            if scaling_type == "llama3":
+                self.rotary_emb = LlamaLlama3ScalingRotaryEmbedding(
+                    self.head_dim,
+                    max_position_embeddings=self.max_position_embeddings,
+                    base=rope_base,
+                    scaling_factor=scaling_factor,
+                    low_freq_factor=self.config.rope_scaling.get("low_freq_factor", 1.0),
+                    high_freq_factor=self.config.rope_scaling.get("high_freq_factor", 4.0),
+                    original_max_position_embeddings=self.config.rope_scaling.get(
+                        "original_max_position_embeddings", 8192
+                    ),
+                    device="cpu"
+                )
+            elif scaling_type == "linear":
                 self.rotary_emb = LlamaLinearScalingRotaryEmbedding(
                     self.head_dim,
                     max_position_embeddings=self.max_position_embeddings,
                     scaling_factor=scaling_factor,
-                    base=self.rope_theta,
+                    base=rope_base,
                     device="cpu"
                 )
             elif scaling_type == "dynamic":
@@ -1500,7 +1572,7 @@ class LlamaAttention(nn.Module):
                     self.head_dim,
                     max_position_embeddings=self.max_position_embeddings,
                     scaling_factor=scaling_factor,
-                    base=self.rope_theta,
+                    base=rope_base,
                     device="cpu"
                 )
             else:
@@ -2603,6 +2675,8 @@ class LlamaModel(LlamaPreTrainedModel):
             all_hidden_states += (hidden_states,)
 
         next_cache = None
+        if use_cache:
+            next_cache = next_decoder_cache.to_legacy_cache() if use_legacy_cache else next_decoder_cache
         if not return_dict:
             return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
         return BaseModelOutputWithPast(
