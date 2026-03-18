@@ -1,4 +1,26 @@
+# Python
 __pycache__/
+*.pyc
+*.pyo
+
+# Virtual environments
 venv/
+venv_calibrate/
+
+# Build artifacts
+*.egg-info/
+*.egg
+dist/
+build/
+*.so
+*.o
+
+# Claude
 .claude/
+
+# Data
 data/longbench_v1/
+data/longbench_v2/
+
+# outputs
+run.log
