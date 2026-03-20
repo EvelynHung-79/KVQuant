@@ -71,7 +71,11 @@ __global__ void SPMV_ATOMIC_ROPE_BALANCED(
     int num_outliers,
     float rope_theta,
     int pos_offset,
-    int num_groups
+    int num_groups,
+    float llama3_orig_max_pos,
+    float llama3_low_freq_factor,
+    float llama3_high_freq_factor,
+    float llama3_scaling_factor
 );
 
 template <typename scalar_t>
@@ -150,7 +154,11 @@ __global__ void VecQuant4MatMulKernelNUQPerChannelTransposedRopeMHABatchedFusedO
     int batch_size,
     float rope_theta,
     int pos_offset,
-    int num_groups
+    int num_groups,
+    float llama3_orig_max_pos,
+    float llama3_low_freq_factor,
+    float llama3_high_freq_factor,
+    float llama3_scaling_factor
 );
 
 __global__ void VecQuant3MatMulKernelNUQPerChannelTransposedMHABatchedFusedOpt(
@@ -492,7 +500,11 @@ __global__ void SPMV_ATOMIC_ROPE_BALANCED(
     int num_outliers,
     float rope_theta,
     int pos_offset,
-    int num_groups
+    int num_groups,
+    float llama3_orig_max_pos,
+    float llama3_low_freq_factor,
+    float llama3_high_freq_factor,
+    float llama3_scaling_factor
 ) {
 
     int threadid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -515,6 +527,20 @@ __global__ void SPMV_ATOMIC_ROPE_BALANCED(
 
             // RoPE embeddings (same for all Q heads sharing this KV head)
             theta = powf(rope_theta, (-2 * __int2float_rd(channel_head_off % (headdim/2)) / headdim));
+            // Llama3 per-frequency scaling (llama3_orig_max_pos > 0 enables it)
+            if (llama3_orig_max_pos > 0.0f) {
+                float wavelen = 2.0f * 3.14159265358979323846f / theta;
+                float low_freq_wavelen  = llama3_orig_max_pos / llama3_low_freq_factor;
+                float high_freq_wavelen = llama3_orig_max_pos / llama3_high_freq_factor;
+                if (wavelen > low_freq_wavelen) {
+                    theta = theta / llama3_scaling_factor;
+                } else if (wavelen >= high_freq_wavelen) {
+                    float smooth = (llama3_orig_max_pos / wavelen - llama3_low_freq_factor)
+                                   / (llama3_high_freq_factor - llama3_low_freq_factor);
+                    theta = (1.0f - smooth) * theta / llama3_scaling_factor + smooth * theta;
+                }
+                // else: high-freq, unchanged
+            }
             sign = (channel_head_off < (headdim/2)) ? 1 : -1;
             c = cosf(theta * (row + pos_offset));
             s = sinf(theta * (row + pos_offset));
@@ -3062,7 +3088,11 @@ __global__ void VecQuant4MatMulKernelNUQPerChannelTransposedRopeMHABatchedFusedO
     int batch_size,
     float rope_theta,
     int pos_offset,
-    int num_groups   // num_q_heads / num_kv_heads; 1 for MHA
+    int num_groups,   // num_q_heads / num_kv_heads; 1 for MHA
+    float llama3_orig_max_pos,
+    float llama3_low_freq_factor,
+    float llama3_high_freq_factor,
+    float llama3_scaling_factor
 ) {
 
   // GQA: blockIdx.z indexes Q heads (0..num_q_heads-1)
@@ -3097,7 +3127,24 @@ __global__ void VecQuant4MatMulKernelNUQPerChannelTransposedRopeMHABatchedFusedO
   }
 
   int headdim2 = headdim/2;
-  deq2[16][off] = powf ( rope_theta , (-2 * __int2float_rd(off % headdim2) / __int2float_rd(headdim)) );
+  {
+    float theta_val = powf(rope_theta, (-2 * __int2float_rd(off % headdim2) / __int2float_rd(headdim)));
+    // Llama3 per-frequency scaling
+    if (llama3_orig_max_pos > 0.0f) {
+        float wavelen = 2.0f * 3.14159265358979323846f / theta_val;
+        float low_freq_wavelen  = llama3_orig_max_pos / llama3_low_freq_factor;
+        float high_freq_wavelen = llama3_orig_max_pos / llama3_high_freq_factor;
+        if (wavelen > low_freq_wavelen) {
+            theta_val = theta_val / llama3_scaling_factor;
+        } else if (wavelen >= high_freq_wavelen) {
+            float smooth = (llama3_orig_max_pos / wavelen - llama3_low_freq_factor)
+                           / (llama3_high_freq_factor - llama3_low_freq_factor);
+            theta_val = (1.0f - smooth) * theta_val / llama3_scaling_factor + smooth * theta_val;
+        }
+        // else: high-freq, unchanged
+    }
+    deq2[16][off] = theta_val;
+  }
 
   __syncthreads();
 
@@ -3470,8 +3517,11 @@ void vecquant4matmul_nuq_perchannel_transposed_rope_mha_batched_fused_opt_cuda(
   torch::Tensor lookup_table,
   int kcachelen,
   float rope_theta,
-  int pos_offset
-  // torch::Tensor value
+  int pos_offset,
+  float llama3_orig_max_pos,
+  float llama3_low_freq_factor,
+  float llama3_high_freq_factor,
+  float llama3_scaling_factor
 ) {
 
   // mul - out - (batch, num_q_heads, kseqlen)
@@ -3514,7 +3564,8 @@ void vecquant4matmul_nuq_perchannel_transposed_rope_mha_batched_fused_opt_cuda(
     mul.data_ptr<float>(),
     lookup_table.data_ptr<float>(),
     height, width, fullwidth, headdim, num_kv_heads, batch_size, rope_theta, pos_offset,
-    num_groups
+    num_groups,
+    llama3_orig_max_pos, llama3_low_freq_factor, llama3_high_freq_factor, llama3_scaling_factor
   );
 
 }
@@ -3584,7 +3635,11 @@ void vecquant4matmul_nuq_perchannel_transposed_rope_mha_batched_fused_opt2_cuda(
   torch::Tensor outliers,
   torch::Tensor outlier_indices,
   float rope_theta,
-  int pos_offset
+  int pos_offset,
+  float llama3_orig_max_pos,
+  float llama3_low_freq_factor,
+  float llama3_high_freq_factor,
+  float llama3_scaling_factor
 ) {
 
   // mul - out - (num_heads, qseqlen, kseqlen)
@@ -3635,7 +3690,8 @@ void vecquant4matmul_nuq_perchannel_transposed_rope_mha_batched_fused_opt2_cuda(
     batch_size,
     rope_theta,
     pos_offset,
-    num_groups
+    num_groups,
+    llama3_orig_max_pos, llama3_low_freq_factor, llama3_high_freq_factor, llama3_scaling_factor
   );
 
   int seqlen = outliers.size(0); //full sequence length
@@ -3658,7 +3714,8 @@ void vecquant4matmul_nuq_perchannel_transposed_rope_mha_batched_fused_opt2_cuda(
     num_outliers,
     rope_theta,
     pos_offset,
-    num_groups
+    num_groups,
+    llama3_orig_max_pos, llama3_low_freq_factor, llama3_high_freq_factor, llama3_scaling_factor
   );
 }
 
@@ -4719,7 +4776,8 @@ void vecquant3matmul_nuq_perchannel_transposed_rope_mha_batched_fused_opt2_cuda(
     num_outliers,
     rope_theta,
     pos_offset,
-    1  // num_groups=1 for 3-bit (MHA only)
+    1,  // num_groups=1 for 3-bit (MHA only)
+    0.0f, 1.0f, 4.0f, 8.0f  // llama3 scaling disabled
   );
 }
 
@@ -5479,7 +5537,8 @@ void vecquant2matmul_nuq_perchannel_transposed_rope_mha_batched_fused_opt2_cuda(
     num_outliers,
     rope_theta,
     pos_offset,
-    1  // num_groups=1 for 2-bit (MHA only)
+    1,  // num_groups=1 for 2-bit (MHA only)
+    0.0f, 1.0f, 4.0f, 8.0f  // llama3 scaling disabled
   );
 }
 
@@ -5619,7 +5678,8 @@ void vecquant4matmul_nuq_perchannel_transposed_rope_mha_batched_fused_opt2_orig_
     batch_size,
     rope_theta,
     pos_offset,
-    num_groups_orig_k
+    num_groups_orig_k,
+    0.0f, 1.0f, 4.0f, 8.0f  // llama3 scaling disabled for orig_sparse path
   );
 
   // check if no nonzeros yet

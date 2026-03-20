@@ -400,7 +400,7 @@ def compute_lut(
 
 # class to manage the key cache
 class QuantK(nn.Module):
-    def __init__(self, bits=2, hidden_size=4096, num_heads=32, max_position_embeddings=-1, include_sparse=False, sparsity_threshold=0.99, rope_theta=10000, use_orig_sparse=False, first_few_fp16=0):
+    def __init__(self, bits=2, hidden_size=4096, num_heads=32, max_position_embeddings=-1, include_sparse=False, sparsity_threshold=0.99, rope_theta=10000, use_orig_sparse=False, first_few_fp16=0, rope_scaling=None):
 
         """
         bits: number of bits for quantization
@@ -450,6 +450,18 @@ class QuantK(nn.Module):
 
         # For LWM - rope theta
         self.rope_theta = rope_theta
+
+        # Llama3-type RoPE scaling parameters (None = standard RoPE)
+        if rope_scaling is not None and (rope_scaling.get("rope_type") or rope_scaling.get("type")) == "llama3":
+            self.llama3_orig_max_pos     = float(rope_scaling.get("original_max_position_embeddings", 8192))
+            self.llama3_low_freq_factor  = float(rope_scaling.get("low_freq_factor", 1.0))
+            self.llama3_high_freq_factor = float(rope_scaling.get("high_freq_factor", 4.0))
+            self.llama3_scaling_factor   = float(rope_scaling.get("factor", 8.0))
+        else:
+            self.llama3_orig_max_pos     = 0.0  # disabled
+            self.llama3_low_freq_factor  = 1.0
+            self.llama3_high_freq_factor = 4.0
+            self.llama3_scaling_factor   = 8.0
 
         # dense-and-sparse quantization parameters for original code
         self.rows = torch.tensor([]).cuda()
@@ -844,7 +856,11 @@ class QuantK(nn.Module):
                     self.outliers,
                     self.outlier_indices,
                     self.rope_theta,
-                    self.first_few_fp16
+                    self.first_few_fp16,
+                    self.llama3_orig_max_pos,
+                    self.llama3_low_freq_factor,
+                    self.llama3_high_freq_factor,
+                    self.llama3_scaling_factor,
                 )
 
             elif self.bits == 3:
@@ -890,7 +906,11 @@ class QuantK(nn.Module):
                     self.lookup_table,
                     self.klen - self.first_few_fp16,
                     self.rope_theta,
-                    self.first_few_fp16
+                    self.first_few_fp16,
+                    self.llama3_orig_max_pos,
+                    self.llama3_low_freq_factor,
+                    self.llama3_high_freq_factor,
+                    self.llama3_scaling_factor,
                 )
             elif self.bits == 3:
                 quant_cuda.vecquant3matmul_nuq_perchannel_transposed_rope_mha_batched_fused_opt(
@@ -1507,7 +1527,8 @@ class LlamaAttention(nn.Module):
                 max_position_embeddings=maxseqlen,
                 rope_theta=self.rope_theta,
                 use_orig_sparse=self.use_orig_sparse,
-                first_few_fp16=self.first_few_fp16
+                first_few_fp16=self.first_few_fp16,
+                rope_scaling=self.config.rope_scaling,
             )
             self.vcache = QuantV(
                 bits=self.abits,
@@ -1668,11 +1689,21 @@ class LlamaAttention(nn.Module):
             else:
                 key_states_rope = apply_rotary_pos_emb_query(key_states, cos, sin, position_ids)
 
-            # parallel version (not using quantized KV cache)
-            key_states_rope = key_states_rope.transpose(2, 3)
-            attn_weights = torch.matmul(query_states, key_states_rope) / math.sqrt(self.head_dim)
+            # Save original (num_kv_heads) key_states_rope for fp16 cache before GQA expansion
+            key_states_rope_kv = key_states_rope.transpose(2, 3)
 
-            # support for keeping first few tokens in fp16
+            # Use SDPA for memory-efficient prefill attention (avoids OOM on long sequences).
+            # SDPA handles GQA natively, so no repeat_kv needed here.
+            causal_mask = attention_mask
+            attn_output = nn.functional.scaled_dot_product_attention(
+                query_states,
+                repeat_kv(key_states_rope, self.num_key_value_groups),
+                repeat_kv(value_states, self.num_key_value_groups),
+                attn_mask=causal_mask,
+                dropout_p=0.0,
+            )
+
+            # parallel append - K
             if self.first_few_fp16 > 0:
                 if q_len > self.first_few_fp16:
                     # parallel append
@@ -1682,13 +1713,13 @@ class LlamaAttention(nn.Module):
                     else:
                         self.kcache.parallel_pack(key_states)
 
-                    # create fp16 k cache
-                    self.kcache_fp16[:,:,:,:] = key_states_rope[:,:,:,:self.first_few_fp16]
+                    # create fp16 k cache (use unexpanded kv-head version)
+                    self.kcache_fp16[:,:,:,:] = key_states_rope_kv[:,:,:,:self.first_few_fp16]
                     self.kcache.klen += self.first_few_fp16
 
                 else:
-                    # only initialize fp16 kcache
-                    self.kcache_fp16[:,:,:,:q_len] = key_states_rope
+                    # only initialize fp16 kcache (use unexpanded kv-head version)
+                    self.kcache_fp16[:,:,:,:q_len] = key_states_rope_kv
                     self.kcache.klen += q_len
 
             else: # no fp16 kcache
@@ -1699,6 +1730,35 @@ class LlamaAttention(nn.Module):
                     self.kcache.parallel_pack_orig(key_states)
                 else:
                     self.kcache.parallel_pack(key_states)
+
+            # parallel append - V
+            if self.first_few_fp16 > 0:
+
+                if q_len > self.first_few_fp16:
+
+                    # create fp16 vcache
+                    self.vcache_fp16[:,:,:,:] = value_states[:,:,:self.first_few_fp16,:]
+
+                    # parallel append
+                    value_states = value_states[0,:,self.first_few_fp16:,:].transpose(1, 2)
+                    self.vcache.parallel_pack(value_states, upper_outlier_vals[self.first_few_fp16:,:], upper_outlier_indices[self.first_few_fp16:,:], lower_outlier_vals[self.first_few_fp16:,:], lower_outlier_indices[self.first_few_fp16:,:])
+
+                    # create fp16 k cache
+                    self.vcache.vlen += self.first_few_fp16
+
+                else:
+                    # only initialize fp16 kcache
+                    self.vcache_fp16[:,:,:q_len,:] = value_states
+                    self.vcache.vlen += q_len
+
+            else:
+                value_states = value_states[0,:,:,:].transpose(1, 2)
+                self.vcache.parallel_pack(value_states, upper_outlier_vals, upper_outlier_indices, lower_outlier_vals, lower_outlier_indices)
+
+            # reshape attn output
+            attn_output = attn_output.transpose(1, 2).contiguous()
+            attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+
         else:
 
             if self.kcache.klen < self.first_few_fp16:
@@ -1713,13 +1773,15 @@ class LlamaAttention(nn.Module):
                 self.kcache_fp16[:,:,:,self.kcache.klen] = key_states_rope.squeeze(-1)
                 self.kcache.klen += 1
 
-                # perform multiplication
+                # perform multiplication - expand KV heads for GQA
                 ktensor = self.kcache_fp16[:,:,:,:self.kcache.klen]
+                ktensor = ktensor.repeat_interleave(self.num_key_value_groups, dim=1)
                 attn_weights = torch.matmul(query_states, ktensor) / math.sqrt(self.head_dim)
 
             elif self.first_few_fp16 > 0:
-                # compute fp16 kcache
-                attn_weights_fp16 = torch.matmul(query_states, self.kcache_fp16) / math.sqrt(self.head_dim)
+                # compute fp16 kcache - expand KV heads for GQA
+                kcache_fp16_exp = self.kcache_fp16.repeat_interleave(self.num_key_value_groups, dim=1)
+                attn_weights_fp16 = torch.matmul(query_states, kcache_fp16_exp) / math.sqrt(self.head_dim)
 
                 # fused forward pass
                 query_states = query_states[0,:,:,:]
@@ -1744,61 +1806,23 @@ class LlamaAttention(nn.Module):
                 attn_weights = attn_weights.unsqueeze(0)
                 attn_weights = attn_weights / math.sqrt(self.head_dim)
 
-        if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
-            raise ValueError(
-                f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
-                f" {attn_weights.size()}"
-            )
+            # Decode path: attn_weights → softmax → V-cache attention output
+            if attention_mask is not None:
+                attn_weights = attn_weights + attention_mask
 
-        if attention_mask is not None:
-            if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
-                raise ValueError(
-                    f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
-                )
-            attn_weights = attn_weights + attention_mask
+            # upcast attention to fp32
+            attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
 
-        # upcast attention to fp32
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
-
-        # fused forward pass
-        if q_len > 1  and self.vcache.vlen == 0:
-            # parallel version
-            attn_output = torch.matmul(attn_weights, value_states)
-
-            # parallel append
-            if self.first_few_fp16 > 0:
-
-                if q_len > self.first_few_fp16:
-
-                    # create fp16 vcache
-                    self.vcache_fp16[:,:,:,:] = value_states[:,:,:self.first_few_fp16,:]
-
-                    # parallel append
-                    value_states = value_states[0,:,self.first_few_fp16:,:].transpose(1, 2)
-                    self.vcache.parallel_pack(value_states, upper_outlier_vals[self.first_few_fp16:,:], upper_outlier_indices[self.first_few_fp16:,:], lower_outlier_vals[self.first_few_fp16:,:], lower_outlier_indices[self.first_few_fp16:,:])
-
-                    # create fp16 k cache
-                    self.vcache.vlen += self.first_few_fp16
-
-                else:
-                    # only initialize fp16 kcache
-                    self.vcache_fp16[:,:,:q_len,:] = value_states
-                    self.vcache.vlen += q_len
-
-            else:
-                value_states = value_states[0,:,:,:].transpose(1, 2)
-                self.vcache.parallel_pack(value_states, upper_outlier_vals, upper_outlier_indices, lower_outlier_vals, lower_outlier_indices)
-
-        else:
             if self.vcache.vlen < self.first_few_fp16:
                 self.vcache_fp16[:,:,self.vcache.vlen,:] = value_states.squeeze(2)
                 self.vcache.vlen += 1
-                attn_output = torch.matmul(attn_weights, self.vcache_fp16[:,:,:self.vcache.vlen,:])
+                vcache_fp16_exp = self.vcache_fp16.repeat_interleave(self.num_key_value_groups, dim=1)
+                attn_output = torch.matmul(attn_weights, vcache_fp16_exp[:,:,:self.vcache.vlen,:])
 
             elif self.first_few_fp16 > 0:
                 # compute fp16 vcache attention
-                attn_output_fp16 = torch.matmul(attn_weights[:,:,:,:self.first_few_fp16], self.vcache_fp16)
+                vcache_fp16_exp = self.vcache_fp16.repeat_interleave(self.num_key_value_groups, dim=1)
+                attn_output_fp16 = torch.matmul(attn_weights[:,:,:,:self.first_few_fp16], vcache_fp16_exp)
 
                 # compute quantized vcache attention
                 attn_weights = attn_weights.squeeze(0)
@@ -1813,15 +1837,9 @@ class LlamaAttention(nn.Module):
                 attn_output = self.vcache.forward_fused_sparse(attn_weights, value_states, upper_outlier_vals, upper_outlier_indices, lower_outlier_vals, lower_outlier_indices)
                 attn_output = attn_output.unsqueeze(0)
 
-
-        if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
-            raise ValueError(
-                f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
-                f" {attn_output.size()}"
-            )
-
-        attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+            # reshape decode attn output
+            attn_output = attn_output.transpose(1, 2).contiguous()
+            attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
 
 
         if self.config.pretraining_tp > 1:
@@ -2018,13 +2036,15 @@ class LlamaFlashAttention2(LlamaAttention):
                 self.kcache_fp16[:,:,:,self.kcache.klen] = key_states_rope.squeeze(-1)
                 self.kcache.klen += 1
 
-                # perform multiplication
+                # perform multiplication - expand KV heads for GQA
                 ktensor = self.kcache_fp16[:,:,:,:self.kcache.klen]
+                ktensor = ktensor.repeat_interleave(self.num_key_value_groups, dim=1)
                 attn_weights = torch.matmul(query_states, ktensor) / math.sqrt(self.head_dim)
 
             elif self.first_few_fp16 > 0:
-                # compute fp16 kcache
-                attn_weights_fp16 = torch.matmul(query_states, self.kcache_fp16) / math.sqrt(self.head_dim)
+                # compute fp16 kcache - expand KV heads for GQA
+                kcache_fp16_exp = self.kcache_fp16.repeat_interleave(self.num_key_value_groups, dim=1)
+                attn_weights_fp16 = torch.matmul(query_states, kcache_fp16_exp) / math.sqrt(self.head_dim)
 
                 # fused forward pass
                 query_states = query_states[0,:,:,:]
@@ -2057,11 +2077,13 @@ class LlamaFlashAttention2(LlamaAttention):
             if self.vcache.vlen < self.first_few_fp16:
                 self.vcache_fp16[:,:,self.vcache.vlen,:] = value_states.squeeze(2)
                 self.vcache.vlen += 1
-                attn_output = torch.matmul(attn_weights, self.vcache_fp16[:,:,:self.vcache.vlen,:])
+                vcache_fp16_exp = self.vcache_fp16.repeat_interleave(self.num_key_value_groups, dim=1)
+                attn_output = torch.matmul(attn_weights, vcache_fp16_exp[:,:,:self.vcache.vlen,:])
 
             elif self.first_few_fp16 > 0:
                 # compute fp16 vcache attention
-                attn_output_fp16 = torch.matmul(attn_weights[:,:,:,:self.first_few_fp16], self.vcache_fp16)
+                vcache_fp16_exp = self.vcache_fp16.repeat_interleave(self.num_key_value_groups, dim=1)
+                attn_output_fp16 = torch.matmul(attn_weights[:,:,:,:self.first_few_fp16], vcache_fp16_exp)
 
                 # compute quantized vcache attention
                 attn_weights = attn_weights.squeeze(0)
@@ -2576,7 +2598,13 @@ class LlamaModel(LlamaPreTrainedModel):
                 use_cache = False
 
         past_key_values_length = 0
-        if use_cache:
+        # KVQuant: when using quantized KV cache, derive past length from
+        # kcache.klen and disable HF DynamicCache (KVQuant manages cache
+        # internally via self.kcache / self.vcache on each attention layer).
+        if getattr(self.config, 'abits', 16) < 16:
+            past_key_values_length = self.layers[0].self_attn.kcache.klen
+            use_cache = False
+        elif use_cache:
             use_legacy_cache = not isinstance(past_key_values, Cache)
             if use_legacy_cache:
                 past_key_values = DynamicCache.from_legacy_cache(past_key_values)

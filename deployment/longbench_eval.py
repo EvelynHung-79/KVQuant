@@ -37,6 +37,7 @@ if _cuda_builds:
 
 import numpy as np
 import torch
+from tqdm import tqdm
 
 from kvquant_model import get_model, load_quantizers, run_inference
 from longbench_scoring import score_sample
@@ -145,7 +146,7 @@ def main():
     details = []
     scores = []
 
-    for idx, sample in enumerate(samples):
+    for idx, sample in enumerate(tqdm(samples, desc="Processing samples")):
         prompt = build_prompt(sample, args.task, tokenizer, max_input_tokens)
         input_ids = tokenizer(prompt, return_tensors="pt", add_special_tokens=False).input_ids
 
@@ -163,13 +164,13 @@ def main():
 
         score = score_sample(output_text, answers, metric_name)
 
-        print(
-            f"[{idx}] "
-            f"score={score:.4f}  prefill={prefill_ms:.0f}ms  "
-            f"decode={decode_ms:.0f}ms  peak={peak_mb:.1f}MB"
-        )
-        print(f"  output   : {output_text[:120]}")
-        print(f"  expected : {answers[0][:120]}")
+        # print(
+        #     f"[{idx}] "
+        #     f"score={score:.4f}  prefill={prefill_ms:.0f}ms  "
+        #     f"decode={decode_ms:.0f}ms  peak={peak_mb:.1f}MB"
+        # )
+        # print(f"  output   : {output_text[:120]}")
+        # print(f"  expected : {answers[0][:120]}")
 
         scores.append(score)
         details.append({
@@ -218,7 +219,7 @@ def main():
     }
 
     os.makedirs(os.path.dirname(os.path.abspath(args.output_path)), exist_ok=True)
-    with open(args.output_path, "w") as f:
+    with open(args.output_path, "w", encoding="utf-8") as f:
         json.dump(result, f, indent=4, ensure_ascii=False)
 
     print(f"\n=== {args.task} ===")

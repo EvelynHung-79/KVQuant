@@ -187,28 +187,34 @@ void vecquant2appendvecVsparseParallel(
 
 void vecquant4matmul_nuq_perchannel_transposed_rope_mha_batched_fused_opt_cuda(
   torch::Tensor vec, torch::Tensor mat, torch::Tensor mul,
-  torch::Tensor lookup_table, int kcachelen, float theta, int pos_offset
+  torch::Tensor lookup_table, int kcachelen, float theta, int pos_offset,
+  float llama3_orig_max_pos, float llama3_low_freq_factor, float llama3_high_freq_factor, float llama3_scaling_factor
 );
 void vecquant4matmul_nuq_perchannel_transposed_rope_mha_batched_fused_opt(
   torch::Tensor vec, torch::Tensor mat, torch::Tensor mul,
-  torch::Tensor lookup_table, int kcachelen, float theta, int pos_offset
+  torch::Tensor lookup_table, int kcachelen, float theta, int pos_offset,
+  float llama3_orig_max_pos, float llama3_low_freq_factor, float llama3_high_freq_factor, float llama3_scaling_factor
 ) {
   const at::cuda::OptionalCUDAGuard device_guard(device_of(vec));
-  vecquant4matmul_nuq_perchannel_transposed_rope_mha_batched_fused_opt_cuda(vec, mat, mul, lookup_table, kcachelen, theta, pos_offset);
+  vecquant4matmul_nuq_perchannel_transposed_rope_mha_batched_fused_opt_cuda(vec, mat, mul, lookup_table, kcachelen, theta, pos_offset,
+    llama3_orig_max_pos, llama3_low_freq_factor, llama3_high_freq_factor, llama3_scaling_factor);
 }
 
 void vecquant4matmul_nuq_perchannel_transposed_rope_mha_batched_fused_opt2_cuda(
   torch::Tensor vec, torch::Tensor mat, torch::Tensor mul,
   torch::Tensor lookup_table, int kcachelen,
-  torch::Tensor outliers, torch::Tensor outlier_indices, float theta, int pos_offset
+  torch::Tensor outliers, torch::Tensor outlier_indices, float theta, int pos_offset,
+  float llama3_orig_max_pos, float llama3_low_freq_factor, float llama3_high_freq_factor, float llama3_scaling_factor
 );
 void vecquant4matmul_nuq_perchannel_transposed_rope_mha_batched_fused_opt2(
   torch::Tensor vec, torch::Tensor mat, torch::Tensor mul,
   torch::Tensor lookup_table, int kcachelen,
-  torch::Tensor outliers, torch::Tensor outlier_indices, float theta, int pos_offset
+  torch::Tensor outliers, torch::Tensor outlier_indices, float theta, int pos_offset,
+  float llama3_orig_max_pos, float llama3_low_freq_factor, float llama3_high_freq_factor, float llama3_scaling_factor
 ) {
   const at::cuda::OptionalCUDAGuard device_guard(device_of(vec));
-  vecquant4matmul_nuq_perchannel_transposed_rope_mha_batched_fused_opt2_cuda(vec, mat, mul, lookup_table, kcachelen, outliers, outlier_indices, theta, pos_offset);
+  vecquant4matmul_nuq_perchannel_transposed_rope_mha_batched_fused_opt2_cuda(vec, mat, mul, lookup_table, kcachelen, outliers, outlier_indices, theta, pos_offset,
+    llama3_orig_max_pos, llama3_low_freq_factor, llama3_high_freq_factor, llama3_scaling_factor);
 }
 
 void vecquant4matmul_nuq_perchannel_transposed_mha_batched_fused_opt_cuda(
