@@ -14,9 +14,7 @@ dist/
 build/
 *.so
 *.o
-
-# Claude
-.claude/
+kvquant.egg-info/
 
 # Data
 data/longbench_v1/

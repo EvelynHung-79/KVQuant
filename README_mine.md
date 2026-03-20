@@ -25,20 +25,19 @@ pip install -e deployment/transformers/
 # deployment 主套件
 pip install -e deployment/ --no-build-isolation
 
+# 評分套件（ROUGE-L 和 edit_sim 用）
+pip install rouge fuzzywuzzy python-Levenshtein
+
 # 編譯 CUDA extension（需要 nvcc）
 cd deployment/kvquant && python setup_cuda.py install && cd ../..
 
 # 讓 quant_cuda 每次都能找到 torch shared libraries
-echo 'export LD_LIBRARY_PATH="$VIRTUAL_ENV/lib/python3.11/site-packages/torch/lib:$LD_LIBRARY_PATH"' \
-  >> venv/bin/activate
+echo 'export LD_LIBRARY_PATH="$VIRTUAL_ENV/lib/python3.11/site-packages/torch/lib:$LD_LIBRARY_PATH"' >> venv/bin/activate
 
 # 重新 activate 讓 LD_LIBRARY_PATH 生效
 source venv/bin/activate
 ```
-
- # Huggingface
- huggingface-cli login
- hf_MsunjexXeNDaolHSNtbppwsykJCmytScVab
+ _EWXDELkcgPsWjrlEIpUInlBMYXDFDZbnba
 
  # Copy Dataset
  scp -r ./longbench_v1/ pod2:/root/KVQuant/data/

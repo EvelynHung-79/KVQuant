@@ -9,12 +9,12 @@ export CUDA_VISIBLE_DEVICES=0
 #   Summarization  → gov_report
 #   Few-shot       → trec,samsum
 #   Code           → lcc
-python deployment/longbench_eval.py --task multifieldqa_en --bits 16
-python deployment/longbench_eval.py --task hotpotqa --bits 16
-python deployment/longbench_eval.py --task gov_report --bits 16
-python deployment/longbench_eval.py --task trec --bits 16
+python deployment/longbench_eval.py --task qasper --bits 16
+python deployment/longbench_eval.py --task 2wikimqa --bits 16
+python deployment/longbench_eval.py --task multi_news --bits 16
 python deployment/longbench_eval.py --task samsum --bits 16
-python deployment/longbench_eval.py --task lcc --bits 16
+python deployment/longbench_eval.py --task passage_count --bits 16
+python deployment/longbench_eval.py --task repobench-p --bits 16
 
 # Single-doc QA
 python deployment/longbench_eval.py --task narrativeqa
