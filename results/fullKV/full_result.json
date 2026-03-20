@@ -1,0 +1,98 @@
+[
+  {
+    "task": "narrativeqa",
+    "score": 0.2950,
+    "latency_s": 8.4,
+    "memory_MB": 30944
+  },
+  {
+    "task": "qasper",
+    "score": 0.4457,
+    "latency_s": 1.6,
+    "memory_MB": 20413
+  },
+  {
+    "task": "multifieldqa_en",
+    "score": 0.5596,
+    "latency_s": 1.9,
+    "memory_MB": 18917
+  },
+  {
+    "task": "hotpotqa",
+    "score": 0.5795,
+    "latency_s": 2.6,
+    "memory_MB": 19250
+  },
+  {
+    "task": "2wikimqa",
+    "score": 0.4909,
+    "latency_s": 1.4,
+    "memory_MB": 19245
+  },
+  {
+    "task": "musique",
+    "score": 0.3255,
+    "latency_s": 3.3,
+    "memory_MB": 19252
+  },
+  {
+    "task": "gov_report",
+    "score": 0.3430,
+    "latency_s": 17.4,
+    "memory_MB": 27616
+  },
+  {
+    "task": "qmsum",
+    "score": 0.2512,
+    "latency_s": 6.5,
+    "memory_MB": 22604
+  },
+  {
+    "task": "multi_news",
+    "score": 0.2692,
+    "latency_s": 14.0,
+    "memory_MB": 18668
+  },
+  {
+    "task": "trec",
+    "score": 0.7300,
+    "latency_s": 3.2,
+    "memory_MB": 18047
+  },
+  {
+    "task": "triviaqa",
+    "score": 0.9173,
+    "latency_s": 2.3,
+    "memory_MB": 20904
+  },
+  {
+    "task": "samsum",
+    "score": 0.4375,
+    "latency_s": 2.8,
+    "memory_MB": 19621
+  },
+  {
+    "task": "passage_retrieval_en",
+    "score": 1.0000,
+    "latency_s": 2.4,
+    "memory_MB": 18964
+  },
+  {
+    "task": "passage_count",
+    "score": 0.1250,
+    "latency_s": 2.9,
+    "memory_MB": 22273
+  },
+  {
+    "task": "lcc",
+    "score": 0.6533,
+    "latency_s": 2.4,
+    "memory_MB": 22527
+  },
+  {
+    "task": "repobench-p",
+    "score": 0.5475,
+    "latency_s": 4.1,
+    "memory_MB": 24672
+  }
+]
