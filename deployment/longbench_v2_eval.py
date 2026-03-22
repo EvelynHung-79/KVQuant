@@ -147,11 +147,11 @@ def main():
             model, tokenizer, input_ids, output_len, args.chunk_size, DEV,
             stop_on_newline=False
         )
-        if output_text .startswith("OOM"):
+        if output_text.startswith("OOM"):
             tqdm.write(f"{output_text} at sample {idx}, with {input_ids.shape[1]} tokens.")
 
         score = score_mcq(output_text, answer)
-        is_oom = output_text .startswith("OOM")
+        is_oom = output_text.startswith("OOM")
         scores.append(score)
         details.append({
             "index": idx,

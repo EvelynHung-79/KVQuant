@@ -161,7 +161,7 @@ def main():
             model, tokenizer, input_ids, output_len, args.chunk_size, DEV,
             stop_on_newline=(args.task in COMPLETION_TASKS)
         )
-        if output_text .startswith("OOM"):
+        if output_text.startswith("OOM"):
             tqdm.write(f"{output_text} at sample {idx}, with {input_ids.shape[1]} tokens.")
 
         if args.task in {"trec", "triviaqa", "samsum"}:
@@ -177,7 +177,7 @@ def main():
         # print(f"  output   : {output_text[:120]}")
         # print(f"  expected : {answers[0][:120]}")
 
-        is_oom = output_text .startswith("OOM")
+        is_oom = output_text.startswith("OOM")
         scores.append(score)
         details.append({
                 "index": idx,
