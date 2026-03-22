@@ -101,18 +101,27 @@ def run_inference(model, tokenizer, input_ids, output_len, chunk_size, DEV, stop
     torch.cuda.reset_peak_memory_stats()
     t0 = time.time()
 
-    with torch.no_grad():
-        gen_out = model.generate(
-            input_ids,
-            attention_mask=attention_mask,
-            max_new_tokens=output_len,
-            do_sample=False,
-            temperature=None,
-            top_p=None,
-            pad_token_id=tokenizer.eos_token_id,
-            eos_token_id=tokenizer.eos_token_id,
-            **extra_kwargs,
-        )
+    try:
+        with torch.no_grad():
+            gen_out = model.generate(
+                input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=output_len,
+                do_sample=False,
+                temperature=None,
+                top_p=None,
+                pad_token_id=tokenizer.eos_token_id,
+                eos_token_id=tokenizer.eos_token_id,
+                **extra_kwargs,
+            )
+    except torch.cuda.OutOfMemoryError:
+        hook.remove()
+        torch.cuda.empty_cache()
+        if prefill_done[0]:
+            prefill_ms = (t_prefill_end[0] - t0) * 1000
+            return "OOM(decode)", prefill_ms, None, 49152.0
+        else:
+            return "OOM(prefill)", None, None, 49152.0
 
     torch.cuda.synchronize()
     t1 = time.time()

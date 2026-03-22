@@ -87,7 +87,7 @@ def main():
                         help="Number of samples to evaluate (-1 = all)")
     parser.add_argument("--chunk-size", type=int, default=512,
                         help="Prefill chunk size in tokens")
-    parser.add_argument("--maxseqlen", type=int, default=32768,
+    parser.add_argument("--maxseqlen", type=int, default=131072,
                         help="Max sequence length (KV cache size)")
     args = parser.parse_args()
 
@@ -149,6 +149,9 @@ def main():
     for idx, sample in enumerate(tqdm(samples, desc="Processing samples")):
         prompt = build_prompt(sample, args.task, tokenizer, max_input_tokens)
         input_ids = tokenizer(prompt, return_tensors="pt", add_special_tokens=False).input_ids
+        if input_ids.shape[1] > max_input_tokens:
+            half = max_input_tokens // 2
+            input_ids = torch.cat([input_ids[:, :half], input_ids[:, input_ids.shape[1] - (max_input_tokens - half):]], dim=1)
 
         answers = sample.get("answers", sample.get("answer", []))
         if isinstance(answers, str):
@@ -158,6 +161,8 @@ def main():
             model, tokenizer, input_ids, output_len, args.chunk_size, DEV,
             stop_on_newline=(args.task in COMPLETION_TASKS)
         )
+        if output_text .startswith("OOM"):
+            tqdm.write(f"{output_text} at sample {idx}, with {input_ids.shape[1]} tokens.")
 
         if args.task in {"trec", "triviaqa", "samsum"}:
             output_text = output_text.lstrip('\n').split('\n')[0]
@@ -172,6 +177,7 @@ def main():
         # print(f"  output   : {output_text[:120]}")
         # print(f"  expected : {answers[0][:120]}")
 
+        is_oom = output_text .startswith("OOM")
         scores.append(score)
         details.append({
                 "index": idx,
@@ -180,15 +186,23 @@ def main():
                 "output": output_text,
                 "ground_truth": answers[0],
                 "peak_memory_mb": peak_mb,
-                "end_to_end_latency_ms": prefill_ms + decode_ms,
+                "end_to_end_latency_ms": (prefill_ms + decode_ms) if (prefill_ms is not None and decode_ms is not None) else None,
                 "prefill_latency_ms": prefill_ms,
                 "decode_latency_ms": decode_ms,
             })
 
-    avg_score = float(np.mean(scores)) if scores else 0.0
-    avg_e2e = float(np.mean([d["end_to_end_latency_ms"] for d in details])) if details else 0.0
-    avg_prefill = float(np.mean([d["prefill_latency_ms"] for d in details])) if details else 0.0
-    avg_decode = float(np.mean([d["decode_latency_ms"] for d in details])) if details else 0.0
+        if is_oom:
+            print(f"OOM at sample {idx}, with {input_ids.shape[1]} tokens.")
+
+    num_oom = sum(1 for d in details if d["output"].startswith("OOM"))
+    valid_scores = [d["score"] for d in details if not d["output"].startswith("OOM")]
+    avg_score = float(np.mean(valid_scores)) if valid_scores else 0.0
+    _e2e = [d["end_to_end_latency_ms"] for d in details if d["end_to_end_latency_ms"] is not None]
+    _prefill = [d["prefill_latency_ms"] for d in details if d["prefill_latency_ms"] is not None]
+    _decode = [d["decode_latency_ms"] for d in details if d["decode_latency_ms"] is not None]
+    avg_e2e = float(np.mean(_e2e)) if _e2e else 0.0
+    avg_prefill = float(np.mean(_prefill)) if _prefill else 0.0
+    avg_decode = float(np.mean(_decode)) if _decode else 0.0
     max_peak = float(max((d["peak_memory_mb"] for d in details), default=0.0))
 
     result = {
@@ -210,6 +224,7 @@ def main():
         },
         "results": {
             "avg_score": avg_score,
+            "num_oom": num_oom,
             "avg_end_to_end_latency_ms": avg_e2e,
             "avg_prefill_latency_ms": avg_prefill,
             "avg_decode_latency_ms": avg_decode,
