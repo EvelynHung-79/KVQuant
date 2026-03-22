@@ -149,7 +149,7 @@ def main():
     parser.add_argument("--output-path", type=str, default=None)
     parser.add_argument("--num-samples", type=int, default=5)
     parser.add_argument("--output-len", type=int, default=64)
-    parser.add_argument("--maxseqlen", type=int, default=32768)
+    parser.add_argument("--maxseqlen", type=int, default=131072)
     parser.add_argument("--n-warmup", type=int, default=2)
     args = parser.parse_args()
 

@@ -40,14 +40,15 @@ def build_prompt(sample, task, tokenizer, max_input_tokens):
     context = sample.get("context", "")
     inp = sample.get("input", "")
 
-    # Truncate context to fit within max_input_tokens
+    # Truncate context to fit within max_input_tokens (head + tail)
     ctx_tokens = tokenizer.encode(context, add_special_tokens=False)
     inp_tokens = tokenizer.encode(inp, add_special_tokens=False)
     max_ctx = max_input_tokens - len(inp_tokens) - 300
     if max_ctx < 0:
         max_ctx = 0
     if len(ctx_tokens) > max_ctx:
-        ctx_tokens = ctx_tokens[:max_ctx]
+        half = max_ctx // 2
+        ctx_tokens = ctx_tokens[:half] + ctx_tokens[len(ctx_tokens) - (max_ctx - half):]
         context = tokenizer.decode(ctx_tokens, skip_special_tokens=True)
 
     user_content = template.format(context=context, input=inp)
