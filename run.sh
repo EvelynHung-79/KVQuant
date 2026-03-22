@@ -43,11 +43,11 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # Longbench_v2 (4-bit 量化)
 python deployment/longbench_v2_eval.py --task single-doc
-python deployment/longbench_v2_eval.py --task multi-doc
-python deployment/longbench_v2_eval.py --task long-context
-python deployment/longbench_v2_eval.py --task dialogue
-python deployment/longbench_v2_eval.py --task code
-python deployment/longbench_v2_eval.py --task structured
+# python deployment/longbench_v2_eval.py --task multi-doc
+# python deployment/longbench_v2_eval.py --task long-context
+# python deployment/longbench_v2_eval.py --task dialogue
+# python deployment/longbench_v2_eval.py --task code
+# python deployment/longbench_v2_eval.py --task structured
 
 # nohup bash ./run.sh > run.log 2>&1 &
 echo "Done"
